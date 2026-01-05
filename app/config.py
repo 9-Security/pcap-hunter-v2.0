@@ -41,4 +41,6 @@ TSHARK_FIELDS = [
     "udp.srcport",
     "udp.dstport",
     "frame.protocols",
+    "eth.src",
+    "eth.dst",
 ]

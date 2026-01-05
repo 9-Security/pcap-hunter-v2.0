@@ -3,9 +3,15 @@ import time
 
 import streamlit as st
 
+import shutil
+from pathlib import Path
+
 from app import config as C
 from app.llm.client import fetch_models, test_connection
 from app.utils.config_manager import get_config_manager
+from app.utils import geo_data
+from app.pipeline.osint_cache import get_osint_cache
+from app.database.repository import CaseRepository
 
 # Keys to persist (mapping session_state key -> config file key)
 PERSIST_KEYS = {
@@ -23,6 +29,11 @@ PERSIST_KEYS = {
     "cfg_osint_cache_enabled": "cfg_osint_cache_enabled",
     "cfg_zeek_bin": "cfg_zeek_bin",
     "cfg_tshark_bin": "cfg_tshark_bin",
+    "cfg_home_lat": "cfg_home_lat",
+    "cfg_home_lon": "cfg_home_lon",
+    "cfg_home_continent": "cfg_home_continent",
+    "cfg_home_country": "cfg_home_country",
+    "cfg_home_city": "cfg_home_city",
 }
 
 
@@ -60,6 +71,13 @@ def init_config_defaults():
     # Binary paths
     _ss_default("cfg_zeek_bin", saved_config.get("cfg_zeek_bin") or "")
     _ss_default("cfg_tshark_bin", saved_config.get("cfg_tshark_bin") or "")
+
+    # Map settings
+    _ss_default("cfg_home_lat", saved_config.get("cfg_home_lat", 0.0))
+    _ss_default("cfg_home_lon", saved_config.get("cfg_home_lon", 0.0))
+    _ss_default("cfg_home_continent", saved_config.get("cfg_home_continent", ""))
+    _ss_default("cfg_home_country", saved_config.get("cfg_home_country", ""))
+    _ss_default("cfg_home_city", saved_config.get("cfg_home_city", ""))
 
 
 def _ss_default(key: str, value):
@@ -286,11 +304,51 @@ def render_config_tab():
             value=int(st.session_state.get("cfg_osint_top_ips", 50)),
             step=5,
         )
-    with osint_col2:
         st.session_state["cfg_osint_cache_enabled"] = st.checkbox(
             "Enable OSINT Cache",
             value=bool(st.session_state.get("cfg_osint_cache_enabled", False)),
             help="Cache OSINT API responses to speed up repeated analysis. Disable for fresh results.",
+        )
+
+    st.markdown("---")
+    st.markdown("#### Map Visualization")
+    st.caption("Select your 'Home' location to draw connectivity links for local traffic on the world map.")
+
+    continents = geo_data.get_continents()
+    curr_cont = st.session_state.get("cfg_home_continent", "")
+    cont_idx = continents.index(curr_cont) if curr_cont in continents else 0
+    
+    sel_cont = st.selectbox("Continent", continents, index=cont_idx)
+    st.session_state["cfg_home_continent"] = sel_cont
+
+    countries = geo_data.get_countries(sel_cont)
+    curr_coun = st.session_state.get("cfg_home_country", "")
+    coun_idx = countries.index(curr_coun) if curr_coun in countries else 0
+    
+    sel_coun = st.selectbox("Country", countries, index=coun_idx)
+    st.session_state["cfg_home_country"] = sel_coun
+
+    cities = geo_data.get_cities(sel_coun)
+    curr_city = st.session_state.get("cfg_home_city", "")
+    city_idx = cities.index(curr_city) if curr_city in cities else 0
+    
+    sel_city = st.selectbox("City", cities, index=city_idx)
+    st.session_state["cfg_home_city"] = sel_city
+
+    # Update lat/lon based on selected city
+    if sel_city:
+        lat, lon = geo_data.get_location_details(sel_city, sel_coun)
+        st.session_state["cfg_home_lat"] = lat
+        st.session_state["cfg_home_lon"] = lon
+
+    mcol1, mcol2, _ = st.columns([1, 1, 2])
+    with mcol1:
+        st.number_input(
+            "Resolved Latitude", value=float(st.session_state.get("cfg_home_lat", 0.0)), format="%.4f", disabled=True
+        )
+    with mcol2:
+        st.number_input(
+            "Resolved Longitude", value=float(st.session_state.get("cfg_home_lon", 0.0)), format="%.4f", disabled=True
         )
 
     st.markdown("---")
@@ -324,35 +382,50 @@ def render_config_tab():
             init_config_defaults()
             st.success("Config reset to defaults.")
             st.rerun()
-    with col_buttons[4]:
-        if st.button("Clear Data", help="Delete all uploaded PCAPs and analysis results"):
-            import shutil
+    st.markdown("---")
+    st.markdown("#### Database & Data Management")
+    st.caption("Granular controls to clear specific types of stored data. Use with caution.")
 
+    dcol1, dcol2, dcol3 = st.columns(3)
+    with dcol1:
+        if st.button("Clear PCAP Data", type="secondary", help="Delete all uploaded PCAPs and extracted files (Zeek, carved files)"):
             try:
-                # Wiping data directory contents
-                if C.DATA_DIR.exists():
-                    for item in C.DATA_DIR.iterdir():
-                        if item.is_file() and item.name != ".gitkeep":
-                            item.unlink()
-                        elif item.is_dir():
-                            shutil.rmtree(item)
-
-                # Re-create structure
-                C.ZEEK_DIR.mkdir(parents=True, exist_ok=True)
+                # Keep the data dir, but wipe subdirs and files that aren't DBs
+                for item in C.DATA_DIR.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    elif item.is_file() and item.suffix != ".db":
+                        item.unlink()
+                # Recreate essential subdirs
                 C.CARVE_DIR.mkdir(parents=True, exist_ok=True)
-
-                st.success("All data cleared successfully.")
-                # Optional: Clear runtime state related to data
-                st.session_state["features"] = None
-                st.session_state["osint"] = None
-                st.session_state["report"] = None
-                st.session_state["zeek_tables"] = {}
-                st.session_state["carved"] = []
-
-                time.sleep(1)  # Give user a moment to see success
+                C.ZEEK_DIR.mkdir(parents=True, exist_ok=True)
+                st.success("PCAP data cleared.")
+                time.sleep(1)
                 st.rerun()
             except Exception as e:
-                st.error(f"Error clearing data: {e}")
+                st.error(f"Error clearing PCAP data: {e}")
+
+    with dcol2:
+        if st.button("Clear OSINT Cache", type="secondary", help="Clear the OSINT cache in SQLite"):
+            try:
+                count = get_osint_cache().invalidate()
+                st.success(f"OSINT Cache cleared ({count} entries).")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error clearing OSINT cache: {e}")
+
+    with dcol3:
+        if st.button("Clear Cases", type="secondary", help="Clear all cases, analyses, and notes from database"):
+            try:
+                if CaseRepository().clear_all():
+                    st.success("Cases and analyses cleared.")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Failed to clear cases.")
+            except Exception as e:
+                st.error(f"Error clearing cases: {e}")
 
     st.markdown("---")
     with st.expander("Runtime Logs"):

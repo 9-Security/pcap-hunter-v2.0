@@ -24,6 +24,17 @@ def inject_css():
         .phase-row .stButton>button { height: 38px; }
         .phase-row .stProgress { margin-top: 6px; }
         .section-title { margin-top: .75rem; margin-bottom: .5rem; }
+        .dashboard-card { 
+            border: 1px solid rgba(255, 255, 255, 0.05); 
+            border-radius: 12px; 
+            padding: 1.25rem; 
+            background-color: rgba(255, 255, 255, 0.02);
+            margin-bottom: 1rem;
+        }
+        .metric-card {
+            background: linear-gradient(135deg, rgba(74, 144, 226, 0.1), rgba(0,0,0,0));
+            border-left: 3px solid #4A90E2;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -75,9 +86,9 @@ def render_export_buttons(data, prefix: str, key_suffix: str = "", is_dataframe:
 
 
 def make_tabs():
-    """Top tabs: Upload • Progress • Dashboard • OSINT • Results • Cases • Config."""
-    tabs = st.tabs(["📤 Upload", "📈 Progress", "📊 Dashboard", "🕵️ OSINT", "📋 Raw Data", "📁 Cases", "⚙️ Config"])
-    return tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6]
+    """Top tabs: Upload • Progress • Dashboard • LLM Analysis • OSINT • Results • Cases • Config."""
+    tabs = st.tabs(["📤 Upload", "📈 Progress", "📊 Dashboard", "🤖 LLM Analysis", "🕵️ OSINT", "📋 Raw Data", "📁 Cases", "⚙️ Config"])
+    return tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6], tabs[7]
 
 
 def make_progress_panel(container):
@@ -213,7 +224,7 @@ def render_osint(result_col, osint_data):
 
     with result_col:
         # Use tabs instead of columns for better space
-        tab_ips, tab_doms = st.tabs(["IP Addresses", "Domains"])
+        tab_ips, tab_doms, tab_devices = st.tabs(["IP Addresses", "Domains", "Devices/MACs"])
 
         # IPs Tab
         with tab_ips:
@@ -224,7 +235,16 @@ def render_osint(result_col, osint_data):
                 vt_rep = vt_attr.get("reputation", "n/a")
                 gn = (obj.get("greynoise") or {}).get("classification", "n/a")
                 ptr = obj.get("ptr", "n/a")
-                ip_rows.append({"IP": ip, "PTR": ptr, "GreyNoise": gn, "VT Rep": vt_rep})
+                city = obj.get("city", "n/a")
+                country = obj.get("country", "n/a")
+                ip_rows.append({
+                    "IP": ip, 
+                    "Country": country,
+                    "City": city,
+                    "PTR": ptr, 
+                    "GreyNoise": gn, 
+                    "VT Rep": vt_rep
+                })
 
             if ip_rows:
                 df_ips = pd.DataFrame(ip_rows)
@@ -280,6 +300,18 @@ def render_osint(result_col, osint_data):
                         show_whois_dialog(target_dom)
             else:
                 st.info("No domain findings.")
+
+        # Devices Tab
+        with tab_devices:
+            st.markdown("#### Device & MAC Identification")
+            mac_data = osint_data.get("macs") or {}
+            if mac_data:
+                mac_rows = []
+                for mac, info in mac_data.items():
+                    mac_rows.append({"MAC Address": mac, "Manufacturer": info.get("manufacturer", "Unknown")})
+                st.dataframe(pd.DataFrame(mac_rows), width="stretch", hide_index=True)
+            else:
+                st.info("No MAC address information available.")
 
 
 def render_flows(result_col, flows: list[dict] | None):

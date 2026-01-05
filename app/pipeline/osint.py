@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from app.pipeline.geoip import GeoIP
 from app.pipeline.osint_cache import get_osint_cache
 from app.pipeline.state import PhaseHandle
 from app.security.opsec import hardened_session
@@ -157,6 +158,12 @@ def enrich(
         if ptr:
             obj["ptr"] = ptr
 
+        # GeoIP (City/Country)
+        geo = GeoIP.lookup(ip)
+        if geo:
+            obj["city"] = geo.get("city")
+            obj["country"] = geo.get("country")
+
         res["ips"][ip] = obj
         cache_status = f" (cached: {cache_hits})" if cache_hits > 0 else ""
         tick(f"OSINT IP {ip}{cache_status}")
@@ -203,6 +210,40 @@ def enrich(
         if cache_hits == 0:
             time.sleep(throttle)
 
+    # MAC Manufacturer Lookup
+    macs = artifacts.get("macs", [])
+    if macs:
+        res["macs"] = {}
+        for mac in macs:
+            res["macs"][mac] = {"manufacturer": get_mac_manufacturer(mac)}
+
     if phase:
         phase.done("OSINT enrichment complete." if not phase.should_skip() else "OSINT skipped.")
     return res
+
+
+def get_mac_manufacturer(mac: str) -> str:
+    """Simple MAC manufacturer lookup based on OUI."""
+    if not mac or ":" not in mac:
+        return "Unknown"
+
+    # Simple dictionary of some common OUIs
+    COMMON_OUIS = {
+        "00:05:5D": "D-Link",
+        "00:0C:29": "VMware",
+        "00:50:56": "VMware",
+        "08:00:27": "VirtualBox",
+        "00:15:5D": "Microsoft (Hyper-V)",
+        "00:1C:42": "Parallels",
+        "00:16:3E": "Xen",
+        "00:25:90": "Supermicro",
+        "00:1A:11": "Google",
+        "3C:5A:B4": "Google",
+        "00:03:FF": "Microsoft",
+        "B8:27:EB": "Raspberry Pi",
+        "DC:A6:32": "Raspberry Pi",
+        "E4:5F:01": "Raspberry Pi",
+    }
+
+    oui = mac.upper()[:8]
+    return COMMON_OUIS.get(oui, "Unknown")

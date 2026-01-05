@@ -2,6 +2,73 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1-alpha] - 2026-01-05
+
+### Added
+- **Cascading Home Location Selectors**: Replaced raw coordinate input with intuitive Continent -> Country -> City dropdowns in the Config tab.
+- **Granular Data Management**: Added dedicated buttons to clear PCAP data, OSINT cache, and Case/Analysis records independently.
+- **Geographic Utilities**: New `geo_data.py` utility handling worldwide city datasets for precise location resolution.
+
+### Changed
+- **Dashboard Aesthetics**: 
+    - Refined flow timeline with optimized marker sizes, opacity, and professional color palettes.
+    - Moved timeline legends to the bottom for a cleaner interactive workspace.
+    - Improved sectioning with custom 'card' styles and subtle borders.
+- **Filter Persistence**: The "Exclude Private IPs" toggle is now persistent across all chart interactions and integrated into the "Clear All Filters" logic.
+- **Enhanced OSINT Table**: Added Country and City columns to the IP OSINT results for better immediate context.
+
+### Fixed
+- **LLM Context Overflow**: Implemented aggressive sanitation and list truncation for flow data to prevent token limit issues with large PCAPs.
+- **UI Performance**: Updated deprecated Streamlit parameters for better layout stability across different browser widths.
+- **Syntax & Safety**: Resolved minor syntax errors in dashboard logic and improved error handling in data clearing operations.
+- **Test Coverage**: Added 61 new/updated unit tests covering geographic resolution and repository resets.
+
+## [0.5.0-alpha] - 2026-01-05
+
+### Added
+- **MITRE ATT&CK Mapping**: 
+    - Automated mapping of detected behaviors and IOCs to the MITRE ATT&CK framework.
+    - Identification of Kill Chain phases and overall campaign severity.
+- **Attack Narrative Generation**:
+    - AI-driven synthesis of timeline events into a coherent security narrative.
+    - Professional reporting in multiple languages (English, Chinese, Japanese, etc.).
+- **IOC Priority Scoring**:
+    - Automated risk assessment system that ranks indicators (Critical to Low) based on OSINT, behavior, and context.
+    - Factors include C2 beaconing scores, VirusTotal detections, DGA likelihood, and JA3/JA3S fingerprinting.
+- **Case Management System**:
+    - A dedicated investigation workspace to track findings, manage observables, and store case notes.
+- **Advanced DNS & TLS Forensics**:
+    - Enhanced DGA detection using Shannon entropy and tunneling analysis.
+    - Comprehensive TLS analysis including certificate chain validation and JA3 fingerprinting.
+- **YARA Scanner**:
+    - Real-time YARA scanning of files carved from HTTP traffic.
+- **PDF Report Export**:
+    - Professional, formatted PDF reports containing executive summaries, interactive chart snapshots, and technical details.
+
+### Fixed
+- **System Stability**: Resolved missing `pango` dependency issue causing PDF generation failures on macOS.
+- **UI Architecture**: Fixed a `NameError` in the main dashboard and restored the missing "LLM Analysis" tab for better flow.
+- **Test Integrity**: Fixed environmental issues preventing the execution of the 300+ test suite.
+
+## [0.4.0-alpha] - 2025-12-30
+
+### Added
+- **Live Traffic Capture**: 
+    - Real-time local traffic capture using `tshark` directly from the Upload interface.
+    - Automatic integration of captured PCAPs into the analysis pipeline.
+- **Enhanced OSINT & Device ID**:
+    - **GeoIP Integration**: Added City and Country of origin for public IPs in OSINT results.
+    - **Hardware Identification**: New "Devices/MACs" tab listing MAC addresses and their manufacturers via OUI lookup.
+- **Advanced Dashboard Visualizations**:
+    - **TopN Analysis**: Tabulated and graphical analysis for top IPs, Ports, Protocols, and Domains.
+    - **Interactive Timeline**: Added a range-slider to the flow timeline, enabling dynamic cross-filtering of all dashboard components (Map, Pie Chart, Bubble Chart, Tables).
+- **Packet Metrics**: Extracted packet lengths and added a distribution histogram to the dashboard.
+
+### Changed
+- **UI Architecture**: Moved the LLM Threat Report to a dedicated "LLM Analysis" tab for better workspace organization.
+- **Packet Parsing**: Updated the pipeline to extract Ethernet MAC addresses and individual packet lengths.
+
+
 ## [0.3.0-alpha] - 2025-12-29
 
 ### Added

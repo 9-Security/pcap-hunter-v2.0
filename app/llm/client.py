@@ -23,6 +23,27 @@ Avoid generic advice. Focus on specific indicators found in the data. If no sign
 state that clearly but note any interesting anomalies."""
 
 
+def _sanitize_for_llm(obj: Any, max_list: int = 15, max_str: int = 500) -> Any:
+    """Recursively truncate data to keep LLM context manageable."""
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            # Strip highly granular per-packet data
+            if k in ("pkt_times", "pkt_lens"):
+                continue
+            new_dict[k] = _sanitize_for_llm(v, max_list, max_str)
+        return new_dict
+    elif isinstance(obj, list):
+        if len(obj) > max_list:
+            return [_sanitize_for_llm(i, max_list, max_str) for i in obj[:max_list]] + ["... [truncated]"]
+        return [_sanitize_for_llm(i, max_list, max_str) for i in obj]
+    elif isinstance(obj, str):
+        if len(obj) > max_str:
+            return obj[:max_str] + "... [truncated]"
+        return obj
+    return obj
+
+
 def generate_report(
     base_url: str, api_key: str, model: str, context: Dict[str, Any], language: str = "US English"
 ) -> str:
@@ -45,7 +66,7 @@ def generate_report(
         proto_counts[p] = proto_counts.get(p, 0) + 1
     top_protos = dict(sorted(proto_counts.items(), key=lambda x: x[1], reverse=True)[:5])
 
-    summary = {
+    summary_raw = {
         "packet_count": context.get("packet_count"),
         "flow_count": len(flows),
         "top_protocols": top_protos,
@@ -62,14 +83,18 @@ def generate_report(
     }
 
     # --- Highlight samples ---
-    highlights = {
-        "top_flows": flows[:5],
-        "sample_zeek": {k: (rows[:3] if isinstance(rows, list) else []) for k, rows in zeek.items()},
-        "sample_osint_ips": list((osint.get("ips") or {}).keys())[:10],
-        "sample_osint_domains": list((osint.get("domains") or {}).keys())[:10],
-        "sample_carved": carved[:5],
-        "sample_beacon": beacon[:5] if isinstance(beacon, list) else [],
+    highlights_raw = {
+        "top_flows": flows[:10],  # Increased to 10 but will be sanitized
+        "sample_zeek": {k: (rows[:5] if isinstance(rows, list) else []) for k, rows in zeek.items()},
+        "sample_osint_ips": list((osint.get("ips") or {}).keys())[:15],
+        "sample_osint_domains": list((osint.get("domains") or {}).keys())[:15],
+        "sample_carved": carved[:10],
+        "sample_beacon": beacon[:10] if isinstance(beacon, list) else [],
     }
+
+    # Sanitize for LLM context
+    summary = _sanitize_for_llm(summary_raw)
+    highlights = _sanitize_for_llm(highlights_raw)
 
     # Language instruction logic
     lang_instruction = ""

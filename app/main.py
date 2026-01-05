@@ -10,6 +10,7 @@ import os
 import time
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from app import config as C
@@ -22,7 +23,7 @@ from app.pipeline.pcap_count import count_packets_fast
 from app.pipeline.pyshark_pass import parse_pcap_pyshark
 from app.pipeline.state import PhaseTracker, end_run, is_run_active, reset_run_state
 from app.pipeline.zeek import load_zeek_any, run_zeek
-from app.ui.charts import plot_flow_timeline, plot_protocol_distribution, plot_world_map
+from app.ui.charts import plot_flow_timeline, plot_protocol_distribution, plot_top_n_charts, plot_world_map
 from app.ui.config_ui import init_config_defaults, render_config_tab
 from app.ui.layout import (
     inject_css,
@@ -108,7 +109,7 @@ if st.session_state.get("trigger_llm_rerun"):
 init_config_defaults()
 
 # Tabs
-tab_upload, tab_progress, tab_dashboard, tab_osint, tab_results, tab_cases, tab_config = make_tabs()
+tab_upload, tab_progress, tab_dashboard, tab_llm, tab_osint, tab_results, tab_cases, tab_config = make_tabs()
 
 # Defaults
 for k, v in [
@@ -145,9 +146,18 @@ with tab_upload:
     if uploaded is not None:
         pcap_path = str((C.DATA_DIR / f"upload_{int(time.time())}.pcap").resolve())
         pathlib.Path(pcap_path).write_bytes(uploaded.read())
-        st.info(f"Uploaded PCAP saved to: {pcap_path}")
-    elif pcap_path_text:
+        st.session_state["__pcap_path"] = pcap_path
+        source_msg = f"Uploaded: {uploaded.name}"
+    elif pcap_path_text.strip():
         pcap_path = pcap_path_text.strip()
+        st.session_state["__pcap_path"] = pcap_path
+        source_msg = f"Manual Path: {pcap_path}"
+    elif st.session_state.get("__pcap_path"):
+        pcap_path = st.session_state["__pcap_path"]
+        source_msg = f"Last Source: {pathlib.Path(pcap_path).name}"
+
+    if pcap_path:
+        st.info(f"**Active Source:** {source_msg}")
 
     do_pyshark = bool(st.session_state.get("cfg_do_pyshark", True))
     do_zeek = bool(st.session_state.get("cfg_do_zeek", True))
@@ -168,7 +178,7 @@ with tab_upload:
         ("LLM report", True),
     ]
 
-    start = st.button("Extract & Analyze", type="primary", use_container_width=True)
+    start = st.button("Extract & Analyze", type="primary", width="stretch")
     if start:
         if not pcap_path or not pathlib.Path(pcap_path).exists():
             st.error("Please upload a PCAP or provide a valid path.")
@@ -550,9 +560,19 @@ with tab_dashboard:
             st.session_state["filter_protos"] = set()
             st.session_state["filter_time"] = None
             st.session_state["map_reset_counter"] += 1
+            if "dashboard_exclude_private" in st.session_state:
+                st.session_state["dashboard_exclude_private"] = False
             st.rerun()
     else:
         st.caption(f"Showing all {len(all_flows)} flows")
+
+    # Global toggle for excluding private IPs
+    exclude_private = st.checkbox(
+        "Exclude Private IPs from Analysis", 
+        value=False, 
+        key="dashboard_exclude_private", 
+        help="Ignore RFC1918 (local) addresses in Top 10 charts and map visualization."
+    )
 
     # 1. World Map
     ip_locs = []
@@ -572,9 +592,13 @@ with tab_dashboard:
                 ip_locs.append(loc)
 
     if ip_locs:
+        # Get home location from session state
+        home_lat = st.session_state.get("cfg_home_lat", 0.0)
+        home_lon = st.session_state.get("cfg_home_lon", 0.0)
+
         # Render map with selection enabled
         map_event = st.plotly_chart(
-            plot_world_map(ip_locs, flows=filtered_flows),
+            plot_world_map(ip_locs, flows=filtered_flows, home_loc=(home_lat, home_lon)),
             width="stretch",
             on_select="rerun",
             selection_mode=["points", "box", "lasso"],
@@ -618,21 +642,12 @@ with tab_dashboard:
             if pie_event and "selection" in pie_event:
                 points = pie_event["selection"].get("points", [])
                 if points:
-                    # Point index usually corresponds to the label order
-                    # But safer to try to get label if available, or infer from index
-                    # Plotly pie selection often gives pointNumber.
-                    # We constructed the chart with keys() as names.
-                    # Let's get the label from the point info if possible, or use index.
-                    # Streamlit's event point dict usually has 'label' for pie charts?
-                    # Let's check point structure. Usually it has pointIndex.
-                    # We can map pointIndex back to the sorted keys.
-                    # Keys in proto_counts are not ordered? dict is ordered in Py3.7+.
-                    labels = list(proto_counts.keys())
                     selected_protos = set()
                     for p in points:
-                        idx = p.get("point_index")
-                        if idx is not None and 0 <= idx < len(labels):
-                            selected_protos.add(labels[idx])
+                        # plot_protocol_distribution now passes labels in customdata
+                        proto = p.get("customdata")
+                        if proto:
+                            selected_protos.add(proto)
 
                     if selected_protos:
                         st.session_state["filter_protos"] = selected_protos
@@ -657,28 +672,99 @@ with tab_dashboard:
                 if points:
                     # Calculate time range from selected points
                     # Each point has x value (time)
-                    # We want the min and max time of the selection
-                    times = [p.get("x") for p in points if p.get("x")]
-                    # Plotly returns strings for dates usually? Or timestamps?
-                    # Pandas datetime objects might be serialized.
-                    # Let's try to parse or use as is if they are comparable.
-                    # If they are strings, we might need to convert.
-                    # But wait, plot_flow_timeline uses datetime objects.
-                    # Streamlit might return them as strings "2023-..."
+                    times = []
+                    for p in points:
+                        tx = p.get("x")
+                        if tx:
+                            try:
+                                # Plotly/Streamlit often returns string "2023-..."
+                                dt = pd.to_datetime(tx)
+                                times.append(dt.timestamp())
+                            except Exception:
+                                continue
                     if times:
-                        try:
-                            # Convert to timestamps
-                            ts_values = [pd.to_datetime(t).timestamp() for t in times]
-                            min_t = min(ts_values)
-                            max_t = max(ts_values)
-                            st.session_state["filter_time"] = (min_t, max_t)
-                            st.rerun()
-                        except Exception:
-                            pass
+                        st.session_state["filter_time"] = (min(times), max(times))
+                        st.rerun()
         else:
             st.info("No flow data available.")
 
+    with st.container():
+        st.markdown("---")
+        st.markdown("#### Top 10 Analysis")
+
+        if filtered_flows:
+            # Calculate Top 10s
+            top_src_ips = {}
+            top_dst_ips = {}
+            top_dst_ports = {}
+            top_protos = {}
+            top_domains = {}
+
+            # Use the global toggle from session state
+            exclude_private = st.session_state.get("dashboard_exclude_private", False)
+
+            for f in filtered_flows:
+                src = f.get("src")
+                dst = f.get("dst")
+                dport = str(f.get("dport", "N/A"))
+                proto = f.get("proto", "Unknown")
+
+                if src:
+                    if not exclude_private or is_public_ipv4(src):
+                        top_src_ips[src] = top_src_ips.get(src, 0) + 1
+                if dst:
+                    if not exclude_private or is_public_ipv4(dst):
+                        top_dst_ips[dst] = top_dst_ips.get(dst, 0) + 1
+                if dport: top_dst_ports[dport] = top_dst_ports.get(dport, 0) + 1
+                if proto: top_protos[proto] = top_protos.get(proto, 0) + 1
+
+            # Domains from DNS analysis or Zeek logs
+            dns_data = st.session_state.get("dns_analysis")
+            if dns_data and isinstance(dns_data, dict):
+                for d in dns_data.get("top_queried", []):
+                    top_domains[d.get("domain", "Unknown")] = d.get("count", 0)
+            elif "dns" in st.session_state.get("zeek_tables", {}):
+                dns_df = st.session_state["zeek_tables"]["dns"]
+                if "query" in dns_df.columns:
+                    domain_counts = dns_df["query"].value_counts().head(10).to_dict()
+                    top_domains.update(domain_counts)
+
+            # Render Top 10s in columns
+            tcol1, tcol2 = st.columns(2)
+
+            with tcol1:
+                st.plotly_chart(plot_top_n_charts(top_src_ips, "Top 10 Source IPs"), width="stretch")
+                with st.expander("Source IP Table"):
+                    st.dataframe(pd.DataFrame(list(top_src_ips.items()), columns=["IP", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+
+                st.plotly_chart(plot_top_n_charts(top_dst_ports, "Top 10 Destination Ports"), width="stretch")
+                with st.expander("Destination Port Table"):
+                    st.dataframe(pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+
+            with tcol2:
+                st.plotly_chart(plot_top_n_charts(top_dst_ips, "Top 10 Destination IPs"), width="stretch")
+                with st.expander("Destination IP Table"):
+                    st.dataframe(pd.DataFrame(list(top_dst_ips.items()), columns=["IP", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+
+                if top_domains:
+                    st.plotly_chart(plot_top_n_charts(top_domains, "Top 10 Domains"), width="stretch")
+                    with st.expander("Domain Table"):
+                        st.dataframe(pd.DataFrame(list(top_domains.items()), columns=["Domain", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                else:
+                    st.plotly_chart(plot_top_n_charts(top_protos, "Top 10 Protocols"), width="stretch")
+                    with st.expander("Protocol Table"):
+                        st.dataframe(pd.DataFrame(list(top_protos.items()), columns=["Protocol", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+
+        else:
+            st.info("Start analysis to see Top 10 metrics.")
+
+
     st.markdown("---")
+    # render_report moved to tab_llm
+
+# 4) LLM Analysis ----------------------
+with tab_llm:
+    st.markdown("### LLM Analysis & Report")
     render_report(st.container(), st.session_state.get("report"))
 
     # PDF Export Section
@@ -733,7 +819,7 @@ with tab_dashboard:
                 key="download_pdf",
             )
 
-# 4) OSINT ----------------------
+# 5) OSINT ----------------------
 with tab_osint:
     st.markdown("### OSINT Investigation")
     render_osint(st.container(), st.session_state.get("osint") or {"ips": {}, "domains": {}, "ja3": {}})

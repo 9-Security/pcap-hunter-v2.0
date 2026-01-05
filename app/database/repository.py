@@ -312,6 +312,30 @@ class CaseRepository:
         finally:
             conn.close()
 
+    def clear_all(self) -> bool:
+        """
+        Clear all data from all tables. Use with caution.
+        
+        Returns:
+            True if cleared successfully.
+        """
+        conn = self._get_conn()
+        try:
+            conn.execute("DELETE FROM notes")
+            conn.execute("DELETE FROM iocs")
+            conn.execute("DELETE FROM analyses")
+            conn.execute("DELETE FROM case_tags")
+            conn.execute("DELETE FROM tags")
+            conn.execute("DELETE FROM cases")
+            conn.commit()
+            logger.info("Cleared all case data from database")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear all data: {e}")
+            return False
+        finally:
+            conn.close()
+
     # ==================== Analysis Operations ====================
 
     def save_analysis(self, analysis: Analysis) -> str:

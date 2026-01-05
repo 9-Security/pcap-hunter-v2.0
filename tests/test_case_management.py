@@ -338,6 +338,25 @@ class TestCaseRepository:
         repo.delete_case(case_id)
         assert repo.get_case(case_id) is None
 
+    def test_clear_all(self, repo):
+        """Test clearing all data from repository."""
+        # Create some data
+        c1 = repo.create_case(Case(title="Case 1"))
+        c2 = repo.create_case(Case(title="Case 2"))
+        repo.add_note(c1, "Note 1")
+        repo.save_analysis(Analysis(case_id=c1, pcap_path="/p1.pcap"))
+        
+        assert len(repo.list_cases()) == 2
+        
+        # Clear all
+        assert repo.clear_all() is True
+        
+        # Verify empty
+        assert len(repo.list_cases()) == 0
+        assert repo.get_case(c1) is None
+        assert repo.get_statistics()["total_cases"] == 0
+        assert repo.get_statistics()["total_analyses"] == 0
+
     def test_save_analysis_to_case(self, repo):
         """Test saving analysis to case."""
         case_id = repo.create_case(Case(title="With Analysis"))

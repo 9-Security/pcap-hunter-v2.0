@@ -22,7 +22,7 @@ def parse_pcap_pyshark(
         log_runtime_error(f"PCAP file not found: {pcap_path}")
         return {
             "flows": [],
-            "artifacts": {"ips": set(), "domains": set(), "urls": set(), "hashes": set(), "ja3": set()},
+            "artifacts": {"ips": set(), "domains": set(), "urls": set(), "hashes": set(), "ja3": set(), "macs": set()},
         }
 
     if limit_packets is not None and not isinstance(limit_packets, int):
@@ -49,8 +49,13 @@ def parse_pcap_pyshark(
     ]
     for field in C.TSHARK_FIELDS:
         cmd.extend(["-e", field])
+    # Add packet length field
+    cmd.extend(["-e", "frame.len"])
 
-    out = {"flows": [], "artifacts": {"ips": set(), "domains": set(), "urls": set(), "hashes": set(), "ja3": set()}}
+    out = {
+        "flows": [],
+        "artifacts": {"ips": set(), "domains": set(), "urls": set(), "hashes": set(), "ja3": set(), "macs": set()},
+    }
     flow_index: Dict[Tuple[str, str, str, str, str], int] = {}
     n = 0
 
@@ -90,6 +95,9 @@ def parse_pcap_pyshark(
                 udp_sport = parts[7]
                 udp_dport = parts[8]
                 protos = parts[9]
+                eth_src = parts[10] if len(parts) > 10 else None
+                eth_dst = parts[11] if len(parts) > 11 else None
+                pkt_len = int(parts[12]) if len(parts) > 12 and parts[12] else 0
 
                 ts = float(ts_str) if ts_str else 0.0
 
@@ -132,6 +140,9 @@ def parse_pcap_pyshark(
                         "proto": proto,
                         "count": 0,
                         "pkt_times": [],
+                        "pkt_lens": [],
+                        "mac_src": eth_src,
+                        "mac_dst": eth_dst,
                     }
                     out["flows"].append(flow)
                     idx = len(out["flows"]) - 1
@@ -140,9 +151,14 @@ def parse_pcap_pyshark(
                 flow = out["flows"][idx]
                 flow["count"] += 1
                 flow["pkt_times"].append(ts)
+                flow["pkt_lens"].append(pkt_len)
 
                 out["artifacts"]["ips"].add(src)
                 out["artifacts"]["ips"].add(dst)
+                if eth_src:
+                    out["artifacts"]["macs"].add(eth_src)
+                if eth_dst:
+                    out["artifacts"]["macs"].add(eth_dst)
 
             # Check for errors after loop
             if proc.poll() and proc.returncode != 0:

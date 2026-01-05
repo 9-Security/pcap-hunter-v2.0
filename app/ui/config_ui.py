@@ -4,7 +4,7 @@ import time
 import streamlit as st
 
 from app import config as C
-from app.llm.client import test_connection, fetch_models
+from app.llm.client import fetch_models, test_connection
 from app.utils.config_manager import get_config_manager
 
 # Keys to persist (mapping session_state key -> config file key)
@@ -33,10 +33,12 @@ def init_config_defaults():
     saved_config = cm.load()
 
     # LLM settings (check saved config first, then env, then defaults)
-    _ss_default("cfg_lm_base_url", saved_config.get("cfg_llm_endpoint") or os.getenv("LMSTUDIO_BASE_URL", C.LM_BASE_URL))
+    lm_base = saved_config.get("cfg_llm_endpoint") or os.getenv("LMSTUDIO_BASE_URL", C.LM_BASE_URL)
+    _ss_default("cfg_lm_base_url", lm_base)
     _ss_default("cfg_lm_api_key", saved_config.get("cfg_openai_key") or os.getenv("LMSTUDIO_API_KEY", C.LM_API_KEY))
     _ss_default("cfg_lm_model", saved_config.get("cfg_llm_model") or os.getenv("LMSTUDIO_MODEL", C.LM_MODEL))
-    _ss_default("cfg_lm_language", saved_config.get("cfg_llm_language") or os.getenv("LMSTUDIO_LANGUAGE", C.LM_LANGUAGE))
+    lm_lang = saved_config.get("cfg_llm_language") or os.getenv("LMSTUDIO_LANGUAGE", C.LM_LANGUAGE)
+    _ss_default("cfg_lm_language", lm_lang)
 
     # OSINT keys
     _ss_default("cfg_otx", saved_config.get("cfg_otx_key") or os.getenv("OTX_KEY", C.OTX_KEY))
@@ -50,6 +52,7 @@ def init_config_defaults():
     _ss_default("cfg_do_pyshark", True)
     _ss_default("cfg_do_zeek", True)
     _ss_default("cfg_do_carve", True)
+    _ss_default("cfg_do_yara", True)
     _ss_default("cfg_pre_count", C.PRECNT_DEFAULT)
     _ss_default("cfg_osint_top_ips", saved_config.get("cfg_osint_top_ips") or C.OSINT_TOP_IPS_DEFAULT)
     _ss_default("cfg_osint_cache_enabled", saved_config.get("cfg_osint_cache_enabled", False))
@@ -108,12 +111,12 @@ def render_config_tab():
 
     # Buttons and shared status
     b1, b2, b3, _ = st.columns([1, 1, 1, 1])
-    
+
     # Action flags
     do_test = False
     do_fetch = False
     do_rerun = False
-    
+
     with b1:
         if st.button("Test Connection"):
             do_test = True
@@ -123,14 +126,14 @@ def render_config_tab():
     with b3:
         if st.button("Re-run Report"):
             do_rerun = True
-            
+
     # Combined status area
     if do_test:
         with st.spinner("Testing connection..."):
             err = test_connection(
                 st.session_state["cfg_lm_base_url"],
                 st.session_state["cfg_lm_api_key"],
-                st.session_state.get("cfg_lm_model", ""), # Model might be empty or valid
+                st.session_state.get("cfg_lm_model", ""),  # Model might be empty or valid
             )
             if not err:
                 st.success("Connection successful!")
@@ -157,13 +160,13 @@ def render_config_tab():
     # Model selection
     available = st.session_state.get("available_models", [])
     current_model = st.session_state.get("cfg_lm_model", "")
-    
+
     if available:
         # If current model is not in available, add it or just default to index 0
         index = 0
         if current_model in available:
             index = available.index(current_model)
-        
+
         selected = st.selectbox("Model name", available, index=index)
         st.session_state["cfg_lm_model"] = selected
     else:
@@ -182,7 +185,7 @@ def render_config_tab():
         "French",
         "German",
     ]
-    
+
     # Callback to update the real config key before script reruns
     def _update_lang():
         st.session_state["cfg_lm_language"] = st.session_state["widget_lm_language"]
@@ -191,16 +194,10 @@ def render_config_tab():
         lang_idx = languages.index(current_lang)
     except ValueError:
         lang_idx = 0
-        
+
     # Use a proxy key 'widget_lm_language' to avoid GC issues when the tab is skipped,
     # but use on_change to ensure 'cfg_lm_language' is updated immediately.
-    st.selectbox(
-        "Report Language", 
-        languages, 
-        index=lang_idx, 
-        key="widget_lm_language", 
-        on_change=_update_lang
-    )
+    st.selectbox("Report Language", languages, index=lang_idx, key="widget_lm_language", on_change=_update_lang)
 
     st.markdown("---")
     st.markdown("#### OSINT API Keys (optional)")
@@ -230,7 +227,7 @@ def render_config_tab():
         st.session_state["cfg_zeek_bin"] = zeek_path
 
         # Check status
-        from app.utils.common import find_bin, make_slug
+        from app.utils.common import find_bin
 
         resolved_zeek = find_bin("zeek", env_key="ZEEK_BIN", cfg_key="cfg_zeek_bin")
         if resolved_zeek:
@@ -258,7 +255,7 @@ def render_config_tab():
         value=int(st.session_state.get("cfg_limit_packets", C.DEFAULT_PYSHARK_LIMIT)),
         step=10000,
     )
-    tc1, tc2, tc3, tc4 = st.columns(4)
+    tc1, tc2, tc3, tc4, tc5 = st.columns(5)
     with tc1:
         st.session_state["cfg_do_pyshark"] = st.checkbox(
             "Run Packet Parsing (Tshark)", value=bool(st.session_state.get("cfg_do_pyshark", True))
@@ -270,6 +267,12 @@ def render_config_tab():
             "Carve HTTP bodies", value=bool(st.session_state.get("cfg_do_carve", True))
         )
     with tc4:
+        st.session_state["cfg_do_yara"] = st.checkbox(
+            "YARA Scan",
+            value=bool(st.session_state.get("cfg_do_yara", True)),
+            help="Scan carved files with YARA rules for malware detection",
+        )
+    with tc5:
         st.session_state["cfg_pre_count"] = st.checkbox(
             "Pre-count packets", value=bool(st.session_state.get("cfg_pre_count", C.PRECNT_DEFAULT))
         )
@@ -324,6 +327,7 @@ def render_config_tab():
     with col_buttons[4]:
         if st.button("Clear Data", help="Delete all uploaded PCAPs and analysis results"):
             import shutil
+
             try:
                 # Wiping data directory contents
                 if C.DATA_DIR.exists():
@@ -332,11 +336,11 @@ def render_config_tab():
                             item.unlink()
                         elif item.is_dir():
                             shutil.rmtree(item)
-                
+
                 # Re-create structure
                 C.ZEEK_DIR.mkdir(parents=True, exist_ok=True)
                 C.CARVE_DIR.mkdir(parents=True, exist_ok=True)
-                
+
                 st.success("All data cleared successfully.")
                 # Optional: Clear runtime state related to data
                 st.session_state["features"] = None
@@ -344,8 +348,8 @@ def render_config_tab():
                 st.session_state["report"] = None
                 st.session_state["zeek_tables"] = {}
                 st.session_state["carved"] = []
-                
-                time.sleep(1) # Give user a moment to see success
+
+                time.sleep(1)  # Give user a moment to see success
                 st.rerun()
             except Exception as e:
                 st.error(f"Error clearing data: {e}")

@@ -7,11 +7,7 @@ def filter_flows_by_ips(flows: list[dict], selected_ips: set[str]) -> list[dict]
     """
     if not selected_ips:
         return flows
-    return [
-        f
-        for f in flows
-        if (f.get("src") in selected_ips) or (f.get("dst") in selected_ips)
-    ]
+    return [f for f in flows if (f.get("src") in selected_ips) or (f.get("dst") in selected_ips)]
 
 
 def filter_flows_by_protocol(flows: list[dict], protocols: set[str]) -> list[dict]:

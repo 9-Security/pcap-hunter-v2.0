@@ -1,15 +1,15 @@
 """OSINT response caching using SQLite."""
+
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -243,16 +243,12 @@ class OSINTCache:
 
             # Entries by provider
             by_provider = {}
-            for row in conn.execute(
-                "SELECT provider, COUNT(*) FROM osint_cache GROUP BY provider"
-            ):
+            for row in conn.execute("SELECT provider, COUNT(*) FROM osint_cache GROUP BY provider"):
                 by_provider[row[0]] = row[1]
 
             # Expired count
             cutoff = time.time() - self.ttl_seconds
-            expired = conn.execute(
-                "SELECT COUNT(*) FROM osint_cache WHERE created_at < ?", (cutoff,)
-            ).fetchone()[0]
+            expired = conn.execute("SELECT COUNT(*) FROM osint_cache WHERE created_at < ?", (cutoff,)).fetchone()[0]
 
             # Database size
             db_size = self.db_path.stat().st_size if self.db_path.exists() else 0

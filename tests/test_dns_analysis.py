@@ -5,16 +5,16 @@ import pytest
 
 from app.pipeline.dns_analysis import (
     DNSRecord,
-    calculate_entropy,
+    analyze_dns,
     calculate_consonant_ratio,
     calculate_digit_ratio,
+    calculate_entropy,
     detect_dga,
     detect_fast_flux,
     detect_tunneling,
     extract_domain_parts,
     is_whitelisted_domain,
     parse_dns_log,
-    analyze_dns,
 )
 
 
@@ -55,7 +55,7 @@ class TestConsonantRatio:
 
     def test_with_numbers(self):
         # Numbers are ignored
-        assert calculate_consonant_ratio("abc123") == pytest.approx(2/3, rel=0.01)
+        assert calculate_consonant_ratio("abc123") == pytest.approx(2 / 3, rel=0.01)
 
     def test_empty_string(self):
         assert calculate_consonant_ratio("") == 0.0
@@ -161,8 +161,9 @@ class TestTunnelingDetection:
     def test_suspicious_many_subdomains(self):
         # Create many unique subdomains (like data exfiltration)
         records = [
-            DNSRecord(ts=float(i), src="192.168.1.1", dst="8.8.8.8",
-                     query=f"unique{i}long{i}data.tunnel.com", qtype="TXT")
+            DNSRecord(
+                ts=float(i), src="192.168.1.1", dst="8.8.8.8", query=f"unique{i}long{i}data.tunnel.com", qtype="TXT"
+            )
             for i in range(100)
         ]
         result = detect_tunneling(records, "tunnel.com")
@@ -179,8 +180,15 @@ class TestFastFluxDetection:
 
     def test_single_ip(self):
         records = [
-            DNSRecord(ts=1.0, src="192.168.1.1", dst="8.8.8.8",
-                     query="example.com", qtype="A", answers=["1.2.3.4"], ttls=[300]),
+            DNSRecord(
+                ts=1.0,
+                src="192.168.1.1",
+                dst="8.8.8.8",
+                query="example.com",
+                qtype="A",
+                answers=["1.2.3.4"],
+                ttls=[300],
+            ),
         ]
         result = detect_fast_flux(records, "example.com")
         assert result.is_fast_flux is False
@@ -189,9 +197,15 @@ class TestFastFluxDetection:
     def test_many_ips_low_ttl(self):
         # Multiple IPs with low TTL = suspicious
         records = [
-            DNSRecord(ts=float(i), src="192.168.1.1", dst="8.8.8.8",
-                     query="fastflux.com", qtype="A",
-                     answers=[f"1.2.3.{i}"], ttls=[30])
+            DNSRecord(
+                ts=float(i),
+                src="192.168.1.1",
+                dst="8.8.8.8",
+                query="fastflux.com",
+                qtype="A",
+                answers=[f"1.2.3.{i}"],
+                ttls=[30],
+            )
             for i in range(20)
         ]
         result = detect_fast_flux(records, "fastflux.com")
@@ -208,33 +222,37 @@ class TestParseDNSLog:
         assert records == []
 
     def test_basic_parsing(self):
-        df = pd.DataFrame([
-            {
-                "ts": 1234567890.0,
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "8.8.8.8",
-                "query": "example.com",
-                "qtype_name": "A",
-                "rcode_name": "NOERROR",
-                "answers": "1.2.3.4",
-                "TTLs": "300",
-            }
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "ts": 1234567890.0,
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "8.8.8.8",
+                    "query": "example.com",
+                    "qtype_name": "A",
+                    "rcode_name": "NOERROR",
+                    "answers": "1.2.3.4",
+                    "TTLs": "300",
+                }
+            ]
+        )
         records = parse_dns_log(df)
         assert len(records) == 1
         assert records[0].query == "example.com"
         assert records[0].qtype == "A"
 
     def test_skip_empty_query(self):
-        df = pd.DataFrame([
-            {
-                "ts": 1234567890.0,
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "8.8.8.8",
-                "query": "-",
-                "qtype_name": "A",
-            }
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "ts": 1234567890.0,
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "8.8.8.8",
+                    "query": "-",
+                    "qtype_name": "A",
+                }
+            ]
+        )
         records = parse_dns_log(df)
         assert records == []
 
@@ -251,24 +269,26 @@ class TestAnalyzeDNS:
         assert result.get("error") == "No DNS log data"
 
     def test_basic_analysis(self):
-        df = pd.DataFrame([
-            {
-                "ts": 1234567890.0,
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "8.8.8.8",
-                "query": "example.com",
-                "qtype_name": "A",
-                "rcode_name": "NOERROR",
-            },
-            {
-                "ts": 1234567891.0,
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "8.8.8.8",
-                "query": "google.com",
-                "qtype_name": "A",
-                "rcode_name": "NOERROR",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "ts": 1234567890.0,
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "8.8.8.8",
+                    "query": "example.com",
+                    "qtype_name": "A",
+                    "rcode_name": "NOERROR",
+                },
+                {
+                    "ts": 1234567891.0,
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "8.8.8.8",
+                    "query": "google.com",
+                    "qtype_name": "A",
+                    "rcode_name": "NOERROR",
+                },
+            ]
+        )
         result = analyze_dns({"dns.log": df})
 
         assert result["total_records"] == 2

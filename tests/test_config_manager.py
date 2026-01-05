@@ -1,9 +1,8 @@
 """Tests for configuration persistence manager."""
-import json
-import pytest
-from pathlib import Path
 
-from app.utils.config_manager import ConfigManager, SENSITIVE_KEYS, DEFAULT_CONFIG
+import pytest
+
+from app.utils.config_manager import DEFAULT_CONFIG, SENSITIVE_KEYS, ConfigManager
 
 
 @pytest.fixture
@@ -81,10 +80,12 @@ class TestConfigEncryption:
 
     def test_non_sensitive_not_encrypted(self, config_manager, temp_config_file):
         """Non-sensitive values should not be encrypted."""
-        config_manager.save({
-            "cfg_llm_endpoint": "http://localhost:1234",
-            "cfg_pyshark_limit": 50000,
-        })
+        config_manager.save(
+            {
+                "cfg_llm_endpoint": "http://localhost:1234",
+                "cfg_pyshark_limit": 50000,
+            }
+        )
 
         raw_content = temp_config_file.read_text()
         assert "http://localhost:1234" in raw_content
@@ -132,10 +133,12 @@ class TestConfigEdgeCases:
 
     def test_numeric_values_preserved(self, config_manager):
         """Numeric values maintain their type."""
-        config_manager.save({
-            "cfg_pyshark_limit": 123456,
-            "cfg_osint_top_ips": 100,
-        })
+        config_manager.save(
+            {
+                "cfg_pyshark_limit": 123456,
+                "cfg_osint_top_ips": 100,
+            }
+        )
         loaded = config_manager.load()
         assert loaded["cfg_pyshark_limit"] == 123456
         assert isinstance(loaded["cfg_pyshark_limit"], int)

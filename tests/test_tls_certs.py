@@ -191,38 +191,42 @@ class TestExtractFromZeekSSL:
         assert result == []
 
     def test_basic_extraction(self):
-        df = pd.DataFrame([
-            {
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "1.2.3.4",
-                "id.resp_p": 443,
-                "server_name": "example.com",
-                "subject": "CN=example.com,O=Example Inc",
-                "issuer": "CN=DigiCert,O=DigiCert Inc",
-                "validation_status": "ok",
-                "version": "TLSv12",
-                "cipher": "TLS_AES_256_GCM_SHA384",
-            }
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "1.2.3.4",
+                    "id.resp_p": 443,
+                    "server_name": "example.com",
+                    "subject": "CN=example.com,O=Example Inc",
+                    "issuer": "CN=DigiCert,O=DigiCert Inc",
+                    "validation_status": "ok",
+                    "version": "TLSv12",
+                    "cipher": "TLS_AES_256_GCM_SHA384",
+                }
+            ]
+        )
         result = extract_from_zeek_ssl({"ssl.log": df})
         assert len(result) == 1
         assert result[0]["server_name"] == "example.com"
         assert result[0]["has_issues"] is False
 
     def test_self_signed_detection(self):
-        df = pd.DataFrame([
-            {
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "1.2.3.4",
-                "id.resp_p": 443,
-                "server_name": "evil.com",
-                "subject": "CN=evil.com",
-                "issuer": "CN=evil.com",
-                "validation_status": "self signed certificate",
-                "version": "TLSv12",
-                "cipher": "TLS_RSA_WITH_AES_128_CBC_SHA",
-            }
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "1.2.3.4",
+                    "id.resp_p": 443,
+                    "server_name": "evil.com",
+                    "subject": "CN=evil.com",
+                    "issuer": "CN=evil.com",
+                    "validation_status": "self signed certificate",
+                    "version": "TLSv12",
+                    "cipher": "TLS_RSA_WITH_AES_128_CBC_SHA",
+                }
+            ]
+        )
         result = extract_from_zeek_ssl({"ssl.log": df})
         assert len(result) == 1
         assert result[0]["has_issues"] is True
@@ -236,6 +240,7 @@ class TestAnalyzeCertificates:
         class MockPhase:
             def should_skip(self):
                 return True
+
             def done(self, msg):
                 pass
 
@@ -243,19 +248,21 @@ class TestAnalyzeCertificates:
         assert result.get("skipped") is True
 
     def test_zeek_ssl_only(self):
-        df = pd.DataFrame([
-            {
-                "id.orig_h": "192.168.1.1",
-                "id.resp_h": "1.2.3.4",
-                "id.resp_p": 443,
-                "server_name": "example.com",
-                "subject": "CN=example.com",
-                "issuer": "CN=CA",
-                "validation_status": "ok",
-                "version": "TLSv12",
-                "cipher": "TLS_AES_256_GCM_SHA384",
-            }
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "id.orig_h": "192.168.1.1",
+                    "id.resp_h": "1.2.3.4",
+                    "id.resp_p": 443,
+                    "server_name": "example.com",
+                    "subject": "CN=example.com",
+                    "issuer": "CN=CA",
+                    "validation_status": "ok",
+                    "version": "TLSv12",
+                    "cipher": "TLS_AES_256_GCM_SHA384",
+                }
+            ]
+        )
         result = analyze_certificates(zeek_tables={"ssl.log": df})
 
         assert "zeek_ssl_summary" in result

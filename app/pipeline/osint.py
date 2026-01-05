@@ -23,6 +23,7 @@ def _get_cache():
     # Update enabled state from session config
     try:
         import streamlit as st
+
         enabled = st.session_state.get("cfg_osint_cache_enabled", False)
         _cache.set_enabled(enabled)
     except Exception:

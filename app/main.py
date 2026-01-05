@@ -37,6 +37,7 @@ from app.ui.layout import (
     render_overview,
     render_report,
     render_tls_certificates,
+    render_yara_results,
     render_zeek,
 )
 from app.utils.common import ensure_dir, is_public_ipv4, make_slug, uniq_sorted
@@ -107,7 +108,7 @@ if st.session_state.get("trigger_llm_rerun"):
 init_config_defaults()
 
 # Tabs
-tab_upload, tab_progress, tab_dashboard, tab_osint, tab_results, tab_config = make_tabs()
+tab_upload, tab_progress, tab_dashboard, tab_osint, tab_results, tab_cases, tab_config = make_tabs()
 
 # Defaults
 for k, v in [
@@ -122,6 +123,7 @@ for k, v in [
     ("map_reset_counter", 0),
     ("dns_analysis", None),
     ("tls_analysis", None),
+    ("yara_results", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -151,6 +153,7 @@ with tab_upload:
     do_zeek = bool(st.session_state.get("cfg_do_zeek", True))
     do_carve = bool(st.session_state.get("cfg_do_carve", True))
     pre_count = bool(st.session_state.get("cfg_pre_count", True))
+    do_yara = bool(st.session_state.get("cfg_do_yara", True))
 
     phases = [
         ("Packet counting (tshark)", pre_count and do_pyshark),
@@ -160,6 +163,7 @@ with tab_upload:
         ("TLS Certificate Analysis", do_zeek),  # Requires Zeek ssl.log
         ("Beaconing ranking", True),
         ("HTTP carving (tshark)", do_carve),
+        ("YARA Scanning", do_carve and do_yara),  # Requires carved files
         ("OSINT enrichment", True),
         ("LLM report", True),
     ]
@@ -182,6 +186,7 @@ with tab_upload:
                 "__pcap_path": pcap_path,
                 "dns_analysis": None,
                 "tls_analysis": None,
+                "yara_results": None,
             }
         )
         st.success("Analysis started. Switch to the **Progress** tab to monitor.")
@@ -203,8 +208,9 @@ with tab_progress:
         do_zeek = bool(st.session_state.get("cfg_do_zeek", True))
         do_carve = bool(st.session_state.get("cfg_do_carve", True))
         pre_count = bool(st.session_state.get("cfg_pre_count", True))
+        do_yara = bool(st.session_state.get("cfg_do_yara", True))
         osint_top_n = int(st.session_state.get("cfg_osint_top_ips", C.OSINT_TOP_IPS_DEFAULT) or 0)
-        
+
         osint_keys = {
             "OTX_KEY": st.session_state.get("cfg_otx", ""),
             "VT_KEY": st.session_state.get("cfg_vt", ""),
@@ -222,6 +228,7 @@ with tab_progress:
             ("TLS Certificate Analysis", do_zeek),  # Requires Zeek ssl.log
             ("Beaconing ranking", True),
             ("HTTP carving (tshark)", do_carve),
+            ("YARA Scanning", do_carve and do_yara),  # Requires carved files
             ("OSINT enrichment", True),
             ("LLM report", True),
         ]
@@ -385,6 +392,20 @@ with tab_progress:
             st.session_state["carved"] = carved
             st.session_state["features"] = features
 
+        # YARA Scanning
+        if dict(phases).get("YARA Scanning", False):
+            p = tracker.next_phase("YARA Scanning")
+            if not st.session_state.get(f"done_{make_slug('YARA Scanning')}", False):
+                if not st.session_state.get(f"skip_{make_slug('YARA Scanning')}", False):
+                    from app.pipeline.yara_scan import scan_carved_files
+
+                    with st.spinner("Scanning carved files with YARA..."):
+                        yara_results = scan_carved_files(carved, phase=p)
+                        st.session_state["yara_results"] = yara_results
+                else:
+                    p.done("YARA scanning skipped.")
+                    st.session_state["yara_results"] = {"skipped": True}
+
         # OSINT
         p = tracker.next_phase("OSINT enrichment")
         if not st.session_state.get(f"done_{make_slug('OSINT enrichment')}", False):
@@ -411,7 +432,7 @@ with tab_progress:
 
         # LLM — pass FULL CONTEXT
         p = tracker.next_phase("LLM report")
-        
+
         llm_slug = make_slug("LLM report")
         llm_done = st.session_state.get(f"done_{llm_slug}", False)
         llm_skip = st.session_state.get(f"skip_{llm_slug}", False)
@@ -452,7 +473,7 @@ with tab_progress:
                         current_lang = st.session_state.get("cfg_lm_language", "US English")
                         print(f"Generating report with language='{current_lang}'", flush=True)
                         st.toast(f"Generating report in {current_lang}...", icon="📝")
-                        
+
                         report_md = generate_report(base_url, api_key, model, context, language=current_lang)
                     except Exception as e:
                         st.error(f"LLM call failed: {e}")
@@ -660,6 +681,58 @@ with tab_dashboard:
     st.markdown("---")
     render_report(st.container(), st.session_state.get("report"))
 
+    # PDF Export Section
+    st.markdown("---")
+    st.markdown("#### Export Report")
+    pdf_col1, pdf_col2 = st.columns([2, 4])
+    with pdf_col1:
+        if st.button("Generate PDF Report", type="primary"):
+            from app.reports.pdf_generator import PDFReportGenerator, ReportConfig
+
+            features = st.session_state.get("features") or {}
+            report_md = st.session_state.get("report") or "No report generated."
+
+            if not features.get("flows") and not report_md:
+                st.warning("No analysis data available. Run analysis first.")
+            else:
+                config = ReportConfig(
+                    title="PCAP Analysis Report",
+                    analyst=st.session_state.get("cfg_analyst_name", ""),
+                    organization=st.session_state.get("cfg_organization", ""),
+                )
+                generator = PDFReportGenerator(config)
+
+                if not generator.is_available:
+                    st.error("PDF generation requires weasyprint. Install with: pip install weasyprint")
+                else:
+                    with st.spinner("Generating PDF report..."):
+                        pdf_report = generator.generate(
+                            report_md=report_md,
+                            features=features,
+                            osint=st.session_state.get("osint"),
+                            yara_results=st.session_state.get("yara_results"),
+                            dns_analysis=st.session_state.get("dns_analysis"),
+                            tls_analysis=st.session_state.get("tls_analysis"),
+                        )
+
+                    if pdf_report:
+                        st.session_state["pdf_report"] = pdf_report
+                        st.success(f"PDF generated: {pdf_report.filename}")
+                    else:
+                        st.error("PDF generation failed. Check logs.")
+
+    # Download button (separate from generate to avoid rerun issues)
+    if st.session_state.get("pdf_report"):
+        pdf_report = st.session_state["pdf_report"]
+        with pdf_col2:
+            st.download_button(
+                label=f"Download {pdf_report.filename}",
+                data=pdf_report.content,
+                file_name=pdf_report.filename,
+                mime="application/pdf",
+                key="download_pdf",
+            )
+
 # 4) OSINT ----------------------
 with tab_osint:
     st.markdown("### OSINT Investigation")
@@ -681,8 +754,15 @@ with tab_results:
         )
         render_zeek(results_panel, st.session_state.get("zeek_tables") or {})
         render_carved(results_panel, st.session_state.get("carved") or [])
+        render_yara_results(results_panel, st.session_state.get("yara_results"))
 
-# 5) Config ----------------------
+# 6) Cases ----------------------
+with tab_cases:
+    from app.ui.cases_tab import render_cases_tab
+
+    render_cases_tab()
+
+# 7) Config ----------------------
 with tab_config:
     render_config_tab()
 

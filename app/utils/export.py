@@ -1,10 +1,10 @@
 """Export utilities for CSV and JSON formats."""
+
 from __future__ import annotations
 
 import csv
 import io
 import json
-import re
 from datetime import datetime
 from typing import Any
 

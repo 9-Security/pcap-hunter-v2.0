@@ -1,20 +1,21 @@
 """Tests for export utilities."""
+
+import csv
 import json
 from io import StringIO
-import csv
 
 import pandas as pd
 import pytest
 
 from app.utils.export import (
-    export_to_csv,
-    export_to_json,
-    export_dataframe_to_csv,
-    export_dataframe_to_json,
-    generate_export_filename,
+    _MAX_EXPORT_ROWS,
     _flatten_dict,
     _sanitize_csv_value,
-    _MAX_EXPORT_ROWS,
+    export_dataframe_to_csv,
+    export_dataframe_to_json,
+    export_to_csv,
+    export_to_json,
+    generate_export_filename,
 )
 
 
@@ -85,10 +86,12 @@ class TestExportToJSON:
 class TestDataFrameExport:
     def test_dataframe_to_csv(self):
         """Test DataFrame to CSV export."""
-        df = pd.DataFrame([
-            {"src": "192.168.1.1", "dst": "8.8.8.8"},
-            {"src": "192.168.1.2", "dst": "1.1.1.1"},
-        ])
+        df = pd.DataFrame(
+            [
+                {"src": "192.168.1.1", "dst": "8.8.8.8"},
+                {"src": "192.168.1.2", "dst": "1.1.1.1"},
+            ]
+        )
         result = export_dataframe_to_csv(df)
         assert b"src,dst" in result
         assert b"192.168.1.1" in result

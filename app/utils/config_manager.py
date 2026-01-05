@@ -1,4 +1,5 @@
 """Configuration persistence manager with encryption for sensitive values."""
+
 from __future__ import annotations
 
 import base64

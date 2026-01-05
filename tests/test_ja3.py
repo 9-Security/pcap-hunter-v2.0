@@ -1,14 +1,14 @@
 """Tests for JA3 TLS fingerprint functionality."""
-import pytest
+
 import pandas as pd
-from pathlib import Path
+import pytest
 
 from app.pipeline.ja3 import (
-    calculate_ja3,
-    lookup_ja3,
-    extract_ja3_from_zeek,
-    analyze_ja3_results,
     KNOWN_JA3_FINGERPRINTS,
+    analyze_ja3_results,
+    calculate_ja3,
+    extract_ja3_from_zeek,
+    lookup_ja3,
 )
 
 
@@ -122,12 +122,24 @@ class TestAnalyzeJA3Results:
 
     def test_analyze_with_malware(self):
         """Analyze DataFrame with malware JA3."""
-        df = pd.DataFrame([
-            {"ja3": "72a589da586844d7f0818ce684948eea", "ja3_client": "Cobalt Strike",
-             "ja3_malware": True, "src": "192.168.1.1", "dst": "10.0.0.1"},
-            {"ja3": "abcd1234" * 4, "ja3_client": "Unknown",
-             "ja3_malware": False, "src": "192.168.1.2", "dst": "8.8.8.8"},
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "ja3": "72a589da586844d7f0818ce684948eea",
+                    "ja3_client": "Cobalt Strike",
+                    "ja3_malware": True,
+                    "src": "192.168.1.1",
+                    "dst": "10.0.0.1",
+                },
+                {
+                    "ja3": "abcd1234" * 4,
+                    "ja3_client": "Unknown",
+                    "ja3_malware": False,
+                    "src": "192.168.1.2",
+                    "dst": "8.8.8.8",
+                },
+            ]
+        )
         result = analyze_ja3_results(df)
 
         assert result["total_tls_sessions"] == 2
@@ -136,10 +148,12 @@ class TestAnalyzeJA3Results:
 
     def test_analyze_no_malware(self):
         """Analyze DataFrame without malware."""
-        df = pd.DataFrame([
-            {"ja3": "abcd1234" * 4, "ja3_client": "Chrome", "ja3_malware": False},
-            {"ja3": "efgh5678" * 4, "ja3_client": "Firefox", "ja3_malware": False},
-        ])
+        df = pd.DataFrame(
+            [
+                {"ja3": "abcd1234" * 4, "ja3_client": "Chrome", "ja3_malware": False},
+                {"ja3": "efgh5678" * 4, "ja3_client": "Firefox", "ja3_malware": False},
+            ]
+        )
         result = analyze_ja3_results(df)
 
         assert result["malware_detected"] is False
@@ -147,11 +161,13 @@ class TestAnalyzeJA3Results:
 
     def test_analyze_top_clients(self):
         """Analyze returns top clients."""
-        df = pd.DataFrame([
-            {"ja3": "a" * 32, "ja3_client": "Chrome"},
-            {"ja3": "b" * 32, "ja3_client": "Chrome"},
-            {"ja3": "c" * 32, "ja3_client": "Firefox"},
-        ])
+        df = pd.DataFrame(
+            [
+                {"ja3": "a" * 32, "ja3_client": "Chrome"},
+                {"ja3": "b" * 32, "ja3_client": "Chrome"},
+                {"ja3": "c" * 32, "ja3_client": "Firefox"},
+            ]
+        )
         result = analyze_ja3_results(df)
 
         assert "Chrome" in result["top_clients"]
@@ -181,9 +197,7 @@ class TestExtractJA3FromZeek:
     def test_extract_no_ja3_data(self, tmp_path):
         """Extract from log without JA3 returns empty DataFrame."""
         ssl_log = tmp_path / "ssl.log"
-        ssl_log.write_text(
-            '{"id.orig_h":"192.168.1.1","id.resp_h":"8.8.8.8"}\n'
-        )
+        ssl_log.write_text('{"id.orig_h":"192.168.1.1","id.resp_h":"8.8.8.8"}\n')
 
         df = extract_ja3_from_zeek(ssl_log)
         assert df.empty

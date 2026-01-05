@@ -75,9 +75,9 @@ def render_export_buttons(data, prefix: str, key_suffix: str = "", is_dataframe:
 
 
 def make_tabs():
-    """Top tabs: Upload • Progress • Dashboard • OSINT • Results • Config."""
-    tabs = st.tabs(["📤 Upload", "📈 Progress", "📊 Dashboard", "🕵️ OSINT", "📋 Raw Data", "⚙️ Config"])
-    return tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5]
+    """Top tabs: Upload • Progress • Dashboard • OSINT • Results • Cases • Config."""
+    tabs = st.tabs(["📤 Upload", "📈 Progress", "📊 Dashboard", "🕵️ OSINT", "📋 Raw Data", "📁 Cases", "⚙️ Config"])
+    return tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6]
 
 
 def make_progress_panel(container):
@@ -237,7 +237,7 @@ def render_osint(result_col, osint_data):
                     selection_mode="single-row",
                     key=f"osint_ips_{len(ip_rows)}",
                 )
-                
+
                 current_sel = event.selection.rows
                 # Check for change
                 if current_sel != st.session_state["last_ip_sel"]:
@@ -270,7 +270,7 @@ def render_osint(result_col, osint_data):
                     selection_mode="single-row",
                     key=f"osint_doms_{len(dom_rows)}",
                 )
-                
+
                 current_sel = event.selection.rows
                 if current_sel != st.session_state["last_dom_sel"]:
                     st.session_state["last_dom_sel"] = current_sel
@@ -610,3 +610,120 @@ def render_batch_summary(result_col, batch_summary: dict | None):
             with st.expander("Processed Files", expanded=False):
                 for fname in filenames:
                     st.text(f"- {fname}")
+
+
+def render_yara_results(result_col, yara_results: dict | None):
+    """Render YARA scan results for carved files."""
+    with result_col:
+        expanded = bool(yara_results and yara_results.get("matched", 0) > 0)
+        with st.expander("YARA Scan Results", expanded=expanded):
+            if not yara_results:
+                st.caption("No YARA scan data available.")
+                return
+
+            if not yara_results.get("yara_available"):
+                st.warning("YARA scanning not available. Install `yara-python` to enable.")
+                return
+
+            if yara_results.get("error"):
+                st.error(f"YARA Error: {yara_results['error']}")
+                return
+
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Files Scanned", yara_results.get("scanned", 0))
+            with col2:
+                matched = yara_results.get("matched", 0)
+                if matched:
+                    st.metric("Matches Found", matched, delta="Alert", delta_color="inverse")
+                else:
+                    st.metric("Matches Found", 0)
+            with col3:
+                st.metric("Rules Loaded", yara_results.get("rule_count", 0))
+            with col4:
+                st.metric("Scan Errors", yara_results.get("errors", 0))
+
+            # Severity breakdown
+            by_severity = yara_results.get("by_severity", {})
+            if any(v > 0 for k, v in by_severity.items() if k != "clean"):
+                st.markdown("**Severity Breakdown:**")
+                sev_cols = st.columns(5)
+                with sev_cols[0]:
+                    critical = by_severity.get("critical", 0)
+                    if critical:
+                        st.error(f"Critical: {critical}")
+                    else:
+                        st.caption(f"Critical: {critical}")
+                with sev_cols[1]:
+                    high = by_severity.get("high", 0)
+                    if high:
+                        st.warning(f"High: {high}")
+                    else:
+                        st.caption(f"High: {high}")
+                with sev_cols[2]:
+                    medium = by_severity.get("medium", 0)
+                    st.caption(f"Medium: {medium}")
+                with sev_cols[3]:
+                    low = by_severity.get("low", 0)
+                    st.caption(f"Low: {low}")
+                with sev_cols[4]:
+                    clean = by_severity.get("clean", 0)
+                    st.caption(f"Clean: {clean}")
+
+            # Results table
+            results = yara_results.get("results", [])
+            if results:
+                st.markdown("---")
+
+                # Filter to show only matches first
+                matches_only = [r for r in results if r.get("has_matches")]
+                if matches_only:
+                    st.markdown("**Files with Matches:**")
+                    rows = []
+                    for r in matches_only:
+                        for m in r.get("matches", []):
+                            rows.append(
+                                {
+                                    "File": r.get("file_path", "").split("/")[-1],
+                                    "Rule": m.get("rule_name", ""),
+                                    "Tags": ", ".join(m.get("rule_tags", [])),
+                                    "Severity": r.get("severity", "unknown"),
+                                    "SHA256": r.get("file_hash", "")[:16] + "...",
+                                }
+                            )
+
+                    if rows:
+                        df_matches = pd.DataFrame(rows)
+                        render_export_buttons(df_matches, "yara_matches", key_suffix="yara", is_dataframe=True)
+
+                        # Color-code by severity
+                        def highlight_severity(row):
+                            sev = row.get("Severity", "")
+                            if sev == "critical":
+                                return ["background-color: #ffcccb"] * len(row)
+                            elif sev == "high":
+                                return ["background-color: #fff3cd"] * len(row)
+                            return [""] * len(row)
+
+                        styled_df = df_matches.style.apply(highlight_severity, axis=1)
+                        st.dataframe(styled_df, width="stretch", hide_index=True)
+
+                # All results in expandable section
+                with st.expander("All Scan Results", expanded=False):
+                    all_rows = []
+                    for r in results:
+                        all_rows.append(
+                            {
+                                "File": r.get("file_path", "").split("/")[-1],
+                                "Size": r.get("file_size", 0),
+                                "Severity": r.get("severity", "clean"),
+                                "Matches": len(r.get("matches", [])),
+                                "Scan Time": f"{r.get('scan_time', 0):.3f}s",
+                                "Error": r.get("error") or "",
+                            }
+                        )
+                    df_all = pd.DataFrame(all_rows)
+                    st.dataframe(df_all, width="stretch", hide_index=True)
+            else:
+                st.caption("No files scanned.")

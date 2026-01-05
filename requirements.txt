@@ -33,3 +33,11 @@ plotly>=5.18.0
 maxminddb-geolite2>=4.1
 ruff>=0.3.0
 python-whois>=0.9
+
+# Phase 3: YARA Scanning (optional)
+yara-python>=4.3.0
+
+# Phase 3: PDF Generation (optional)
+weasyprint>=60.0
+Jinja2>=3.1.0
+markdown>=3.5.0

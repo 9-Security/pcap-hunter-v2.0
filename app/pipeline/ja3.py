@@ -1,4 +1,5 @@
 """JA3/JA3S TLS fingerprint lookup and analysis."""
+
 from __future__ import annotations
 
 import hashlib
@@ -117,7 +118,6 @@ KNOWN_JA3_FINGERPRINTS = {
         "severity": "critical",
         "notes": "Sliver C2 framework",
     },
-
     # ==================== SUSPICIOUS ====================
     "b32309a26951912be7dba376398abc3b": {
         "client": "Python urllib3",
@@ -131,7 +131,6 @@ KNOWN_JA3_FINGERPRINTS = {
         "severity": "medium",
         "notes": "Golang net/http - used by many tools",
     },
-
     # ==================== LEGITIMATE ====================
     # Browsers (keys are MD5 hashes of JA3 strings)
     "9a35e493f961ac377f948690b5334a9c": {
@@ -205,13 +204,15 @@ def calculate_ja3(
                 return []
             return [str(x) for x in items if x is not None and str(x).strip()]
 
-        ja3_string = ",".join([
-            str(version),
-            "-".join(safe_list(ciphers)) or "",
-            "-".join(safe_list(extensions)) or "",
-            "-".join(safe_list(curves)) or "",
-            "-".join(safe_list(point_formats)) or "",
-        ])
+        ja3_string = ",".join(
+            [
+                str(version),
+                "-".join(safe_list(ciphers)) or "",
+                "-".join(safe_list(extensions)) or "",
+                "-".join(safe_list(curves)) or "",
+                "-".join(safe_list(point_formats)) or "",
+            ]
+        )
 
         logger.debug(f"JA3 string: {ja3_string}")
         return hashlib.md5(ja3_string.encode()).hexdigest()
@@ -378,7 +379,7 @@ def analyze_ja3_results(df: pd.DataFrame) -> dict[str, Any]:
     unique_ja3 = df["ja3"].nunique() if "ja3" in df.columns else 0
 
     # Check for malware
-    malware_rows = df[df.get("ja3_malware", False) == True] if "ja3_malware" in df.columns else pd.DataFrame()
+    malware_rows = df[df["ja3_malware"].fillna(False)] if "ja3_malware" in df.columns else pd.DataFrame()
     malware_detected = len(malware_rows) > 0
     malware_ja3 = malware_rows[["ja3", "ja3_client", "src", "dst"]].to_dict("records") if malware_detected else []
 

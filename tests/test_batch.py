@@ -33,7 +33,7 @@ def create_pcap_result(
                 "ips": ips or [],
                 "domains": domains or [],
                 "ja3": ja3 or [],
-            }
+            },
         },
         packet_count=packet_count,
         error=error,
@@ -50,9 +50,7 @@ class TestCorrelateResults:
         assert len(correlation.shared_ips) == 0
 
     def test_single_file(self):
-        results = [
-            create_pcap_result("test.pcap", ips=["1.2.3.4", "5.6.7.8"])
-        ]
+        results = [create_pcap_result("test.pcap", ips=["1.2.3.4", "5.6.7.8"])]
         correlation = correlate_results(results)
         assert correlation.total_unique_ips == 2
         assert len(correlation.shared_ips) == 0  # No sharing with single file
@@ -278,18 +276,22 @@ class TestBatchProcessor:
 
     def test_full_merge(self):
         processor = BatchProcessor([])
-        processor.add_result(create_pcap_result(
-            "file1.pcap",
-            ips=["1.2.3.4", "5.6.7.8"],
-            domains=["evil.com"],
-            packet_count=100,
-        ))
-        processor.add_result(create_pcap_result(
-            "file2.pcap",
-            ips=["1.2.3.4", "9.10.11.12"],
-            domains=["evil.com"],
-            packet_count=200,
-        ))
+        processor.add_result(
+            create_pcap_result(
+                "file1.pcap",
+                ips=["1.2.3.4", "5.6.7.8"],
+                domains=["evil.com"],
+                packet_count=100,
+            )
+        )
+        processor.add_result(
+            create_pcap_result(
+                "file2.pcap",
+                ips=["1.2.3.4", "9.10.11.12"],
+                domains=["evil.com"],
+                packet_count=200,
+            )
+        )
 
         result = processor.merge_all()
         assert result.summary["total_files"] == 2

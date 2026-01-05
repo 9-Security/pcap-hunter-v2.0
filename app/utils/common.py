@@ -9,22 +9,23 @@ have been moved to focused modules:
 - string_utils: String manipulation, slugify
 - binary_discovery: Binary tool location
 """
+
 from __future__ import annotations
 
-# Network utilities
-from app.utils.network_utils import get_whois_info, is_public_ipv4, resolve_ip
-
-# Flow filters
-from app.utils.flow_filters import filter_flows_by_ips, filter_flows_by_protocol, filter_flows_by_time
+# Binary discovery
+from app.utils.binary_discovery import find_bin
 
 # File utilities
 from app.utils.file_utils import ensure_dir, sha256_bytes
 
+# Flow filters
+from app.utils.flow_filters import filter_flows_by_ips, filter_flows_by_protocol, filter_flows_by_time
+
+# Network utilities
+from app.utils.network_utils import get_whois_info, is_public_ipv4, resolve_ip
+
 # String utilities
 from app.utils.string_utils import make_slug, uniq_sorted
-
-# Binary discovery
-from app.utils.binary_discovery import find_bin
 
 __all__ = [
     # Network

@@ -488,9 +488,7 @@ class BatchProcessor:
 
         # Enforce file count limit
         if len(paths) > MAX_CONCURRENT_FILES:
-            logger.warning(
-                f"Too many files ({len(paths)}), limiting to {MAX_CONCURRENT_FILES}"
-            )
+            logger.warning(f"Too many files ({len(paths)}), limiting to {MAX_CONCURRENT_FILES}")
             paths = paths[:MAX_CONCURRENT_FILES]
 
         # Validate files and enforce size limits
@@ -508,8 +506,7 @@ class BatchProcessor:
             file_size = path.stat().st_size
             if total_size + file_size > MAX_TOTAL_SIZE_BYTES:
                 logger.warning(
-                    f"Total size limit reached ({MAX_TOTAL_SIZE_BYTES / (1024**3):.0f}GB), "
-                    f"skipping remaining files"
+                    f"Total size limit reached ({MAX_TOTAL_SIZE_BYTES / (1024**3):.0f}GB), skipping remaining files"
                 )
                 break
 
@@ -522,8 +519,7 @@ class BatchProcessor:
         self.results: list[PCAPResult] = []
 
         logger.info(
-            f"BatchProcessor initialized with {len(validated_paths)} files "
-            f"({total_size / (1024**2):.1f}MB total)"
+            f"BatchProcessor initialized with {len(validated_paths)} files ({total_size / (1024**2):.1f}MB total)"
         )
 
     def add_result(self, result: PCAPResult) -> None:
@@ -553,11 +549,7 @@ class BatchProcessor:
         failed = len(self.results) - successful
 
         # Collect error details
-        failed_files = [
-            {"filename": r.filename, "error": r.error}
-            for r in self.results
-            if r.error
-        ]
+        failed_files = [{"filename": r.filename, "error": r.error} for r in self.results if r.error]
 
         summary = {
             "total_files": len(self.results),

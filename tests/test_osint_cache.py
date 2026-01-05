@@ -1,7 +1,8 @@
 """Tests for OSINT caching functionality."""
+
 import time
+
 import pytest
-from pathlib import Path
 
 from app.pipeline.osint_cache import OSINTCache
 

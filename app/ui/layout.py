@@ -155,7 +155,7 @@ def render_carved(result_col, carved):
 
 @st.dialog("WHOIS Info")
 def show_whois_dialog(target: str):
-    from app.utils.common import get_whois_info
+    from app.utils.common import get_whois_info, is_public_ipv4
 
     with st.spinner(f"Fetching WHOIS for {target}..."):
         info = get_whois_info(target)
@@ -170,14 +170,20 @@ def show_whois_dialog(target: str):
             return str(val[0]) if val else "n/a"
         return str(val) if val else "n/a"
 
-    # Helper to format dates
+    # Helper to format dates (supporting space or T separator)
     def _d(val):
         if isinstance(val, list):
             val = val[0] if val else None
-        return str(val).split(" ")[0] if val else "n/a"
+        if not val:
+            return "n/a"
+        s = str(val)
+        if "T" in s:
+            return s.split("T")[0]
+        return s.split(" ")[0]
 
     # Header
-    st.subheader(f"Domain: {info.get('domain_name', target)}")
+    label = "IP" if is_public_ipv4(target) else "Domain"
+    st.subheader(f"{label}: {info.get('domain_name', target)}")
 
     # Key Metrics
     st.text_input("Registrar", value=_s(info.get("registrar")), disabled=True)

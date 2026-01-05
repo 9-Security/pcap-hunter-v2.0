@@ -55,8 +55,8 @@ def test_plot_world_map_lines_variable_width():
         if trace.mode == "lines":
             widths.add(trace.line.width)
 
-    assert 1 in widths
-    assert 5 in widths
+    assert 1.5 in widths
+    assert 6.0 in widths
 
 
 def test_plot_protocol_distribution():
@@ -73,7 +73,12 @@ def test_plot_flow_timeline():
         {"pkt_times": [110, 110], "proto": "UDP", "count": 1, "src": "3.3.3.3", "dst": "4.4.4.4"},
     ]
     fig = plot_flow_timeline(flows)
-    assert len(fig.data) > 0
+    # Now includes an aggregate 'Volume' trace (area chart)
+    # Total traces: 1 (Volume) + 2 (Protocols: TCP, UDP) = 3
+    assert len(fig.data) == 3
+    
     # Check total points across all traces
-    total_points = sum(len(trace.x) for trace in fig.data)
-    assert total_points == 2
+    # TCP trace has 1 point, UDP has 1 point.
+    # Volume trace covers the time range, typically 1 or more points depending on sampling.
+    scatter_points = sum(len(trace.x) for trace in fig.data if trace.mode == "markers")
+    assert scatter_points == 2

@@ -15,7 +15,8 @@ def test_mac_manufacturer_lookup():
 def test_timeline_slider_enabled():
     flows = [{"pkt_times": [1000.0, 1001.0], "proto": "TCP", "src": "1.1.1.1", "dst": "2.2.2.2", "count": 2}]
     fig = plot_flow_timeline(flows)
-    assert fig.layout.xaxis.rangeslider.visible is True
+    # Slider is now intentionally hidden for a cleaner look
+    assert fig.layout.xaxis.rangeslider.visible is False
 
 
 def test_top_n_charts_empty():

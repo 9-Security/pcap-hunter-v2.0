@@ -360,7 +360,7 @@ def render_dns_analysis(result_col, dns_analysis: dict | None):
     """Render DNS analysis results with DGA, tunneling, and fast flux detection."""
     with result_col:
         expanded = bool(
-            dns_analysis
+            dns_analysis is not None
             and (
                 dns_analysis.get("alerts", {}).get("dga_count", 0)
                 or dns_analysis.get("alerts", {}).get("tunneling_count", 0)
@@ -368,7 +368,7 @@ def render_dns_analysis(result_col, dns_analysis: dict | None):
             )
         )
         with st.expander("DNS Analysis", expanded=expanded):
-            if not dns_analysis or dns_analysis.get("error") or dns_analysis.get("skipped"):
+            if dns_analysis is None or dns_analysis.get("error") or dns_analysis.get("skipped"):
                 st.caption("No DNS analysis data available.")
                 return
 
@@ -470,7 +470,7 @@ def render_tls_certificates(result_col, tls_analysis: dict | None):
     """Render TLS certificate analysis results."""
     with result_col:
         expanded = bool(
-            tls_analysis
+            tls_analysis is not None
             and (
                 tls_analysis.get("alerts", {}).get("self_signed_count", 0)
                 or tls_analysis.get("alerts", {}).get("expired_count", 0)
@@ -478,7 +478,7 @@ def render_tls_certificates(result_col, tls_analysis: dict | None):
             )
         )
         with st.expander("TLS Certificates", expanded=expanded):
-            if not tls_analysis or tls_analysis.get("skipped"):
+            if tls_analysis is None or tls_analysis.get("skipped"):
                 st.caption("No TLS certificate data available.")
                 return
 
@@ -727,3 +727,275 @@ def render_yara_results(result_col, yara_results: dict | None):
                     st.dataframe(df_all, width="stretch", hide_index=True)
             else:
                 st.caption("No files scanned.")
+
+
+def render_attack_mapping(result_col, attack_mapping):
+    """Render MITRE ATT&CK mapping results."""
+    with result_col:
+        if attack_mapping is None:
+            return
+
+        expanded = bool(attack_mapping.techniques)
+        with st.expander("MITRE ATT&CK Mapping", expanded=expanded):
+            if not attack_mapping.techniques:
+                st.caption("No ATT&CK techniques detected.")
+                return
+
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Techniques", len(attack_mapping.techniques))
+            with col2:
+                st.metric("Kill Chain Phase", attack_mapping.kill_chain_phase)
+            with col3:
+                severity = attack_mapping.overall_severity
+                if severity == "critical":
+                    st.metric("Severity", severity.upper(), delta="Critical", delta_color="inverse")
+                elif severity == "high":
+                    st.metric("Severity", severity.upper(), delta="High", delta_color="inverse")
+                else:
+                    st.metric("Severity", severity.upper())
+            with col4:
+                tactics = attack_mapping.tactics_summary
+                st.metric("Tactics", len(tactics))
+
+            # Tactics breakdown
+            if attack_mapping.tactics_summary:
+                st.markdown("**Tactics Detected:**")
+                tactic_text = ", ".join(
+                    f"{t} ({c})" for t, c in sorted(attack_mapping.tactics_summary.items(), key=lambda x: -x[1])
+                )
+                st.info(tactic_text)
+
+            # Techniques table
+            st.markdown("---")
+            st.markdown("**Detected Techniques:**")
+
+            rows = []
+            for tech in attack_mapping.techniques:
+                rows.append(
+                    {
+                        "ID": tech.technique_id,
+                        "Name": tech.technique_name,
+                        "Tactic": tech.tactic,
+                        "Confidence": f"{tech.confidence:.0%}",
+                        "Evidence": "; ".join(tech.evidence[:2]),
+                    }
+                )
+
+            if rows:
+                df = pd.DataFrame(rows)
+
+                def highlight_confidence(row):
+                    conf_str = row.get("Confidence", "0%")
+                    conf = float(conf_str.replace("%", "")) / 100
+                    if conf >= 0.8:
+                        return ["background-color: #ffcccb"] * len(row)
+                    elif conf >= 0.6:
+                        return ["background-color: #fff3cd"] * len(row)
+                    return [""] * len(row)
+
+                styled_df = df.style.apply(highlight_confidence, axis=1)
+                st.dataframe(styled_df, width="stretch", hide_index=True)
+
+            # Navigator export button
+            st.markdown("---")
+            try:
+                from app.utils.navigator_export import export_navigator_json
+
+                nav_json = export_navigator_json(attack_mapping)
+                st.download_button(
+                    label="📥 Export ATT&CK Navigator Layer",
+                    data=nav_json,
+                    file_name="attack_navigator_layer.json",
+                    mime="application/json",
+                    key="export_navigator",
+                )
+                st.caption("Import into [ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/)")
+            except Exception as e:
+                st.error(f"Navigator export error: {e}")
+
+
+def render_ioc_export(result_col, features: dict | None, osint: dict | None, scores: dict | None = None):
+    """Render IOC export options."""
+    with result_col:
+        if features is None or not features.get("artifacts"):
+            return
+
+        artifacts = features.get("artifacts", {})
+        total_iocs = (
+            len(artifacts.get("ips", []))
+            + len(artifacts.get("domains", []))
+            + len(artifacts.get("hashes", []))
+            + len(artifacts.get("ja3", []))
+        )
+
+        if total_iocs == 0:
+            return
+
+        with st.expander("IOC Export", expanded=False):
+            st.markdown(f"**Total IOCs:** {total_iocs}")
+
+            # Filter options
+            col1, col2 = st.columns(2)
+            with col1:
+                ioc_types = st.multiselect(
+                    "IOC Types",
+                    ["ip", "domain", "hash", "ja3", "url"],
+                    default=["ip", "domain"],
+                    key="ioc_export_types",
+                )
+            with col2:
+                min_score = st.slider("Minimum Priority Score", 0.0, 1.0, 0.0, 0.1, key="ioc_min_score")
+
+            st.markdown("---")
+
+            try:
+                from app.utils.ioc_export import IOCExporter
+
+                exporter = IOCExporter(features, osint, scores)
+
+                # Export buttons
+                export_cols = st.columns(5)
+
+                with export_cols[0]:
+                    csv_data = exporter.export_csv(ioc_types, min_score)
+                    st.download_button(
+                        label="📄 CSV",
+                        data=csv_data,
+                        file_name="iocs.csv",
+                        mime="text/csv",
+                        key="export_ioc_csv",
+                    )
+
+                with export_cols[1]:
+                    json_data = exporter.export_json(ioc_types, min_score)
+                    st.download_button(
+                        label="📋 JSON",
+                        data=json_data,
+                        file_name="iocs.json",
+                        mime="application/json",
+                        key="export_ioc_json",
+                    )
+
+                with export_cols[2]:
+                    txt_data = exporter.export_txt(ioc_types, min_score)
+                    st.download_button(
+                        label="📝 TXT",
+                        data=txt_data,
+                        file_name="iocs.txt",
+                        mime="text/plain",
+                        key="export_ioc_txt",
+                    )
+
+                with export_cols[3]:
+                    stix_data = exporter.export_stix(ioc_types, min_score)
+                    st.download_button(
+                        label="🔒 STIX",
+                        data=stix_data,
+                        file_name="iocs_stix.json",
+                        mime="application/json",
+                        key="export_ioc_stix",
+                    )
+
+                with export_cols[4]:
+                    st.caption("TXT: Firewall blocklist")
+
+            except Exception as e:
+                st.error(f"IOC export error: {e}")
+
+
+def render_attack_narrative(result_col, narrative: str | None):
+    """Render attack narrative section."""
+    with result_col:
+        if not narrative:
+            return
+
+        with st.expander("Attack Narrative", expanded=True):
+            st.markdown(narrative)
+
+
+def render_ioc_scores(result_col, scored_iocs: list | None):
+    """Render IOC priority scores."""
+    with result_col:
+        if not scored_iocs:
+            return
+
+        with st.expander("IOC Priority Scores", expanded=False):
+            st.markdown("**Top Priority IOCs:**")
+
+            rows = []
+            for ioc in scored_iocs[:20]:  # Show top 20
+                rows.append(
+                    {
+                        "Type": ioc.ioc_type,
+                        "Value": ioc.value[:50] + "..." if len(ioc.value) > 50 else ioc.value,
+                        "Priority": ioc.priority_label.upper(),
+                        "Score": f"{ioc.priority_score:.1%}",
+                        "Recommendation": ioc.recommendation,
+                    }
+                )
+
+            if rows:
+                df = pd.DataFrame(rows)
+
+                def highlight_priority(row):
+                    priority = row.get("Priority", "").lower()
+                    if priority == "critical":
+                        return ["background-color: #ff6b6b"] * len(row)
+                    elif priority == "high":
+                        return ["background-color: #ffa94d"] * len(row)
+                    elif priority == "medium":
+                        return ["background-color: #ffd43b"] * len(row)
+                    return [""] * len(row)
+
+                styled_df = df.style.apply(highlight_priority, axis=1)
+                st.dataframe(styled_df, width="stretch", hide_index=True)
+
+
+def render_qa_interface(result_col, qa_session):
+    """Render interactive Q&A interface."""
+    with result_col:
+        if qa_session is None:
+            return
+
+        with st.expander("Ask Questions About Analysis", expanded=False):
+            # Suggested questions
+            suggested = qa_session.get_suggested_questions()
+            if suggested:
+                st.markdown("**Suggested Questions:**")
+                for i, q in enumerate(suggested[:4]):
+                    if st.button(q, key=f"qa_suggest_{i}"):
+                        st.session_state["qa_question"] = q
+
+            st.markdown("---")
+
+            # Question input
+            question = st.text_input(
+                "Ask a question:",
+                value=st.session_state.get("qa_question", ""),
+                key="qa_input",
+                placeholder="e.g., What are the most critical findings?",
+            )
+
+            if st.button("Ask", key="qa_ask"):
+                if question:
+                    with st.spinner("Analyzing..."):
+                        answer = qa_session.ask(question)
+                    st.markdown("**Answer:**")
+                    st.markdown(answer)
+                    st.session_state["qa_question"] = ""
+
+            # Conversation history
+            history = qa_session.get_conversation_history()
+            if history:
+                with st.expander("Conversation History", expanded=False):
+                    for msg in history:
+                        role = "🧑" if msg["role"] == "user" else "🤖"
+                        st.markdown(f"{role} **{msg['role'].title()}:** {msg['content']}")
+
+            # Clear history button
+            if history:
+                if st.button("Clear History", key="qa_clear"):
+                    qa_session.clear_history()
+                    st.rerun()

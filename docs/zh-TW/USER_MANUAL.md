@@ -1,0 +1,188 @@
+# PCAP Hunter 使用手冊
+
+**PCAP Hunter** 是一個進階的威脅獵捕工作台，旨在填補手動封包分析與自動化資安監控之間的鴻溝。它結合了業界標準工具 (**Zeek**, **Tshark**) 與現代 AI (**LLMs**) 及威脅情資 (**OSINT**)，以快速攝取、分析並從網路流量中提取可執行的情資。
+
+---
+
+## 📚 目錄
+1. [快速入門](#快速入門)
+   - [先決條件](#先決條件)
+   - [安裝與啟動](#安裝與啟動)
+2. [核心工作流程](#核心工作流程)
+   - [資料攝取 (上傳)](#1-資料攝取)
+   - [分析管道](#2-分析管道)
+3. [分析儀表板](#分析儀表板)
+   - [全球地圖與篩選器](#全球地圖與篩選器)
+   - [圖表與視覺化](#圖表與視覺化)
+   - [熱門指標](#熱門指標)
+4. [進階功能](#進階功能)
+   - [AI 威脅報告](#ai-威脅報告)
+   - [OSINT 情資豐富化](#osint-情資豐富化)
+   - [鑑識分析 (DNS, TLS, YARA, Carving)](#鑑識分析)
+5. [設定](#設定)
+   - [LLM 設定](#llm-設定)
+   - [OSINT 金鑰](#osint-金鑰)
+   - [地圖位置](#地圖位置)
+   - [資料管理](#資料管理)
+6. [疑難排解](#疑難排解)
+
+---
+
+## 快速入門
+
+### 先決條件
+請確保您的系統已安裝以下工具：
+- **Python 3.10+**: 核心執行環境。
+- **Zeek**: 用於產生 log 的網路安全監控工具 (`brew install zeek`)。
+- **Wireshark/Tshark**: 用於解析和統計的封包分析工具 (`brew install wireshark`)。
+- **Pango**: 產生 PDF 報告所需的函式庫 (`brew install pango`)。
+- **LM Studio** (選用): 以隱私優先的方式在本地運行 AI 模型。
+
+### 安裝與啟動
+1. **Clone 儲存庫**:
+   ```bash
+   git clone https://github.com/ninedter/pcap-hunter.git
+   cd pcap-hunter
+   ```
+2. **安裝依賴套件**:
+   ```bash
+   make install
+   ```
+3. **執行應用程式**:
+   ```bash
+   make run
+   ```
+   應用程式將在預設瀏覽器中開啟，網址為 `http://localhost:8501`。
+
+---
+
+## 核心工作流程
+
+### 1. 資料攝取
+前往 **Load PCAP** 分頁開始使用。
+
+#### 檔案上傳
+- **拖放 (Drag & Drop)**: 直接將 `.pcap` 或 `.pcapng` 檔案拖入上傳區域。
+- **手動路徑**: 對於瀏覽器難以上傳的大型檔案 (>200MB)，請輸入磁碟上的絕對路徑 (例如 `/Users/name/capture.pcap`) 並按 Enter。
+
+### 2. 分析管道
+預設情況下，PCAP Hunter 會執行完整的分析管道。您可以在 **Config** 分頁的 **Extraction / Analysis** 區塊中自訂要執行的階段 (例如停用 Zeek 或 Carving)。
+
+點擊 **Extract & Analyze** 開始分析。請在 **Progress** 分頁監控進度。
+
+---
+
+## 分析儀表板
+
+**Dashboard** 分頁是您的中央控制台。
+
+### 全球地圖與篩選器
+- **互動式世界地圖**: 視覺化顯示您的流量地理目的地。
+  - **選擇**: 使用 **Box Select** 或 **Lasso Select** 工具選取區域。這將會 **交叉篩選 (cross-filter)** 整個儀表板 (圖表、表格、時間軸)，僅顯示與該區域相關的流量。
+  - **自家位置**: 在 **Config** 分頁設定您的實體位置，以繪製準確的連線。
+- **全域篩選器**:
+  - **排除私有 IP**: 切換此核取方塊以隱藏地圖和「Top 10」圖表中的 RFC1918 (區域網路) 流量。這有助於專注於外部威脅。
+  - **清除所有篩選**: 立即重置儀表板視圖，清除 IP、協定和時間的選取。
+
+### 圖表與視覺化
+- **協定分佈**: 顯示協定比例的圓餅圖 (TCP, UDP, TLS, HTTP 等)。點擊切片可依該協定篩選儀表板。
+- **流量時間軸**: 顯示隨時間變化的流量大小的時間序列圖。
+  - **縮放**: 點擊並拖曳以建立時間視窗。儀表板將更新為僅顯示該特定時段的流量。
+
+### 熱門指標
+- **Top 10 表格**: 顯示最活躍項目的表格和長條圖：
+  - **來源 IP**
+  - **目的地 IP**
+  - **目的地 Port**
+  - **協定** 或 **網域**
+
+---
+
+## 進階功能
+
+### AI 威脅報告
+位於 **LLM Analysis** 分頁。
+- **專業敘事**: AI 會整合出連貫的網路活動故事，而不僅僅是列出 log。
+- **章節**: 包含執行摘要、關鍵發現、入侵指標 (IOCs)、風險評估和建議行動。
+- **PDF 匯出**: 點擊 **Generate PDF Report** 下載格式化的報告。PDF 包含：
+  - 帶有分類 (TLP:CLEAR) 的封面。
+  - 完整的 AI 敘事報告。
+  - 偵測到的 IOC 表格 (IPs, Domains, Hashes)。
+  - YARA 掃描結果。
+  - TLS 分析 (過期/自簽憑證)。
+
+### OSINT 情資豐富化
+位於 **OSINT** 分頁。
+- **IP 情資**: 顯示來自 VirusTotal、GreyNoise (雜訊 vs. 惡意) 的信譽評分和 PTR 紀錄。
+- **網域情資**: 查詢網域的分類和信譽。
+- **WHOIS**: 點擊 IP 或網域可在彈出視窗中查看註冊詳細資訊。
+
+### 鑑識分析
+- **DNS 分析**:
+  - **DGA 偵測**: 使用夏農熵 (Shannon Entropy) 識別惡意軟體使用的隨機生成網域。
+  - **Tunneling**: 標記顯示資料外洩跡象的異常大或頻繁的 DNS 查詢。
+- **TLS 分析**:
+  - **JA3 指紋識別**: 基於 SSL hello 封包識別客戶端應用程式。
+  - **憑證衛生**: 針對自簽、過期或異常憑證發出警報。
+- **YARA 掃描**: 自動掃描從 HTTP 流量中提取的檔案。
+  - **Carved Files**: 儲存於 `./data/carved/`。
+  - **規則**: 使用自訂或標準 YARA 規則偵測已知的惡意軟體家族。
+
+---
+
+## 設定
+
+在 **Config** 分頁自訂應用程式。
+
+### LLM 設定
+- **Endpoint**: 預設為 `http://localhost:1234/v1` (LM Studio)。符合 OpenAI API 標準。
+- **Model**: 輸入模型名稱 (例如 `llama-3.2-3b-instruct`) 或點擊 **Fetch Models** 從伺服器自動填入。
+- **Language**: 選擇報告語言，支援 **9 種語言** (英文, 中文, 日文, 韓文, 義大利文, 西班牙文, 法文, 德文)。
+  - **重新執行報告**: 如果您更改語言或模型，使用此按鈕僅重新生成報告，而無需重新處理 PCAP。
+
+### OSINT 金鑰
+輸入您的 API 金鑰以啟用情資豐富化。金鑰將安全地儲存在您的本地設定中。
+- **VirusTotal**: 用於檔案雜湊和 IP/網域信譽查詢。
+- **AbuseIPDB**: 用於社群回報的惡意 IP。
+- **GreyNoise**: 識別網際網路掃描器 (良性 vs. 惡意)。
+- **Shodan**: 用於裝置指紋識別。
+- **OTX**: AlienVault 開放威脅交換。
+
+### Extraction / Analysis
+啟用或停用特定管道步驟以加速分析或跳過不必要的處理：
+- **PyShark Parsing**: 深度封包檢測 (流量圖表所需)。
+- **Packet Limit**: 最大解析封包數 (預設: 200,000) 以防止記憶體耗盡。
+- **Zeek Processing**: 切換 Zeek log 生成。
+- **Carve HTTP bodies**: 從 HTTP 流量中提取檔案。
+- **YARA Scan**: 掃描提取的檔案 (需啟用 Carving)。
+- **Pre-count packets**: 解析前計算總封包數。
+- **OSINT Cache**: 切換 API 結果的本地快取。
+
+### 地圖位置
+使用級聯選擇器設定您的 **自家位置 (Home Location)**：
+- **洲 (Continent)** -> **國家 (Country)** -> **城市 (City)**
+- 這將固定地圖上連線的起點。
+
+### 資料管理
+管理磁碟使用量的細緻控制：
+- **Save/Load Config**: 跨工作階段保存您的設定 (金鑰、位置、偏好)。
+- **Clear PCAP Data**: 刪除所有上傳的 PCAP、Zeek log 和提取的檔案以釋放磁碟空間。
+- **Clear OSINT Cache**: PCAP Hunter 會快取 API 回應以節省配額。使用此選項強制重新查詢。
+- **Clear Cases**: 清除內部資料庫中的所有調查案件和筆記。
+
+---
+
+## 疑難排解
+
+- **"Binaries not found"**:
+  - 應用程式會嘗試自動偵測 `zeek` 和 `tshark`。
+  - 如果失敗，請檢查 **Config** 分頁中的 **System Health** 區塊。
+  - 您可以在 Config 分頁手動輸入執行檔路徑 (例如 `/opt/homebrew/bin/zeek`)。
+- **"LLM Generation Failed"**:
+  - 確保 LM Studio 正在運行且 "Start Server" 按鈕已啟動。
+  - 確認 Base URL 與 LM Studio 中的一致。
+- **"PDF Generation Error"**:
+  - 需要 `pango` 函式庫。執行：`brew install pango`。
+
+---
+*PCAP Hunter v0.5.1-alpha*

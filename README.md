@@ -30,10 +30,6 @@ By combining industry-standard network analysis tools (**Zeek**, **Tshark**) wit
 ### 4. 🖨️ Professional PDF Export
 - **Stakeholder Ready**: Generate formatted, professional PDF reports containing the full attack narrative, technical summaries, and dashboard visualizations.
 
-### 5. 📡 Live Traffic Capture
-- **Real-Time Analysis**: Capture live traffic directly from local interfaces (e.g., Wi-Fi, Ethernet) using `tshark`.
-- **Seamless Integration**: Captured traffic is automatically saved and injected into the full analysis pipeline.
-
 ### 6. 🔍 Deep Packet Inspection & Flow Analysis
 - **Multi-Engine Pipeline**: Uses **PyShark** for granular packet inspection and **Tshark** for high-speed statistics.
 - **Protocol Parsing**: Automatically extracts and visualizes metadata for major protocols:
@@ -89,7 +85,7 @@ By combining industry-standard network analysis tools (**Zeek**, **Tshark**) wit
 
 ### 13. 🌐 OSINT Enrichment
 Integrates with leading threat intelligence providers to validate indicators of compromise (IOCs):
-- [x] 📖 **[User Manual](file:///Users/ninedter/Documents/Git Related/SecOps/pcap-hunter/USER_MANUAL.md)**: Detailed feature guide with screenshots.
+- [x] 📖 **[User Manual (English)](docs/en/USER_MANUAL.md)** | **[中文說明 (Traditional Chinese)](docs/zh-TW/README.md)**
 - **VirusTotal**: File hash and IP/Domain reputation.
 - **AbuseIPDB**: Crowdsourced IP abuse reports.
 - **GreyNoise**: Identification of internet background noise and scanners.
@@ -127,9 +123,8 @@ Integrates with leading threat intelligence providers to validate indicators of 
 
 ## 📖 Usage Guide
 
-1. **Upload or Capture**: 
+1. **Upload**: 
    - Drag and drop a `.pcap` file in the **Upload** tab.
-   - **OR** Select a network interface and click **Start Capture** to ingest live traffic. Click **Stop Capture** when finished.
 2. **Configure**:
     - Set your LLM endpoint (default: `http://localhost:1234/v1`).
     - **Home Location**: Set your geographic location using cascading Continent -> Country -> City selectors for accurate map connectivity visualization.
@@ -161,15 +156,6 @@ Defaults are managed in `app/config.py`. Key settings include:
 ---
 
 ## 🔧 Troubleshooting
-
-### macOS Live Capture Permissions
-If you encounter a `Permission Denied` error when starting a capture on macOS:
-
-1. **Quick Fix**: Run the following command in your project directory. This will trigger a native macOS password prompt to grant the necessary permissions:
-   ```bash
-   make fix-permissions
-   ```
-2. **Permanent Fix**: Install the **ChmodBPF** package provided by the [Wireshark installer](https://www.wireshark.org/download.html). This is the standard way to grant capture permissions to non-root users on macOS permanently across reboots.
 
 ## 📄 License
 MIT License. See `LICENSE` for details.

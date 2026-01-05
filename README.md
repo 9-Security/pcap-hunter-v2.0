@@ -89,6 +89,7 @@ By combining industry-standard network analysis tools (**Zeek**, **Tshark**) wit
 
 ### 13. 🌐 OSINT Enrichment
 Integrates with leading threat intelligence providers to validate indicators of compromise (IOCs):
+- [x] 📖 **[User Manual](file:///Users/ninedter/Documents/Git Related/SecOps/pcap-hunter/USER_MANUAL.md)**: Detailed feature guide with screenshots.
 - **VirusTotal**: File hash and IP/Domain reputation.
 - **AbuseIPDB**: Crowdsourced IP abuse reports.
 - **GreyNoise**: Identification of internet background noise and scanners.

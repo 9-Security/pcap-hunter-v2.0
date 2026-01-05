@@ -4,6 +4,8 @@
 
 By combining industry-standard network analysis tools (**Zeek**, **Tshark**) with modern **Large Language Models (LLMs)** and **OSINT** APIs, PCAP Hunter automates the tedious parts of packet analysis—parsing, correlation, and enrichment—allowing analysts to focus on detection and response.
 
+📖 **[User Manual (English)](docs/en/USER_MANUAL.md)** | **[中文說明 (Traditional Chinese)](docs/zh-TW/README.md)**
+
 ---
 
 ## 🚀 Key Features
@@ -85,7 +87,6 @@ By combining industry-standard network analysis tools (**Zeek**, **Tshark**) wit
 
 ### 13. 🌐 OSINT Enrichment
 Integrates with leading threat intelligence providers to validate indicators of compromise (IOCs):
-- [x] 📖 **[User Manual (English)](docs/en/USER_MANUAL.md)** | **[中文說明 (Traditional Chinese)](docs/zh-TW/README.md)**
 - **VirusTotal**: File hash and IP/Domain reputation.
 - **AbuseIPDB**: Crowdsourced IP abuse reports.
 - **GreyNoise**: Identification of internet background noise and scanners.

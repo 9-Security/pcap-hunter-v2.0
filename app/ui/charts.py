@@ -545,3 +545,176 @@ def plot_network_graph(
     )
     return fig
 
+
+_WELL_KNOWN_PORTS: Dict[str, str] = {
+    "20": "FTP-Data", "21": "FTP", "22": "SSH", "23": "Telnet",
+    "25": "SMTP", "53": "DNS", "67": "DHCP", "68": "DHCP",
+    "80": "HTTP", "110": "POP3", "123": "NTP", "143": "IMAP",
+    "443": "HTTPS", "445": "SMB", "465": "SMTPS", "587": "SMTP",
+    "993": "IMAPS", "995": "POP3S", "1883": "MQTT", "3306": "MySQL",
+    "3389": "RDP", "5060": "SIP", "5061": "SIPS", "5222": "XMPP",
+    "5223": "APNs", "5228": "FCM", "5353": "mDNS", "5432": "PostgreSQL",
+    "6379": "Redis", "8080": "HTTP-Alt", "8443": "HTTPS-Alt",
+    "8883": "MQTT-TLS", "9200": "Elasticsearch",
+}
+
+
+def _port_label(dport: str, proto: str) -> str:
+    """Return a human-readable label for a destination port."""
+    name = _WELL_KNOWN_PORTS.get(dport, "")
+    if name:
+        return f"{dport}/{name}"
+    return f"{dport}/{proto.upper()}"
+
+
+def plot_sankey_flows(
+    flows: List[Dict[str, Any]],
+    max_services: int = 10,
+    max_clients: int = 8,
+    max_servers: int = 12,
+) -> go.Figure:
+    """Plot a Sankey diagram: Client IP → Service Port → Server IP.
+
+    Each flow is normalised so the side with the well-known port
+    (< 10000) is treated as the server.  Flows where neither port is
+    well-known are assigned to the lower port side.
+    """
+    if not flows:
+        return go.Figure()
+
+    # --- Step 1: normalise every flow and aggregate ---
+    agg: Dict[tuple, int] = defaultdict(int)
+
+    for f in flows:
+        src = f.get("src", "")
+        dst = f.get("dst", "")
+        if not src or not dst:
+            continue
+
+        try:
+            sp = int(f.get("sport") or 0)
+        except (ValueError, TypeError):
+            sp = 0
+        try:
+            dp = int(f.get("dport") or 0)
+        except (ValueError, TypeError):
+            dp = 0
+
+        proto = (f.get("proto") or "unknown")
+        count = f.get("count", 1)
+
+        # Determine which side is the server (well-known port)
+        sp_wk = 0 < sp < 10000
+        dp_wk = 0 < dp < 10000
+
+        if dp_wk and not sp_wk:
+            # dst has the service port → dst is server
+            client, server, svc_port = src, dst, dp
+        elif sp_wk and not dp_wk:
+            # src has the service port → src is server, flip
+            client, server, svc_port = dst, src, sp
+        elif dp_wk and sp_wk:
+            # Both well-known — use the lower port as service
+            if dp <= sp:
+                client, server, svc_port = src, dst, dp
+            else:
+                client, server, svc_port = dst, src, sp
+        else:
+            # Neither well-known — skip (ephemeral-to-ephemeral)
+            continue
+
+        service = _port_label(str(svc_port), proto)
+        agg[(client, service, server)] += count
+
+    if not agg:
+        return go.Figure()
+
+    # --- Step 2: rank and pick top nodes ---
+    cli_totals: Dict[str, int] = defaultdict(int)
+    svc_totals: Dict[str, int] = defaultdict(int)
+    srv_totals: Dict[str, int] = defaultdict(int)
+    for (c, s, d), cnt in agg.items():
+        cli_totals[c] += cnt
+        svc_totals[s] += cnt
+        srv_totals[d] += cnt
+
+    top_cli = [x for x, _ in sorted(cli_totals.items(), key=lambda v: -v[1])[:max_clients]]
+    top_svc = [x for x, _ in sorted(svc_totals.items(), key=lambda v: -v[1])[:max_services]]
+    top_srv = [x for x, _ in sorted(srv_totals.items(), key=lambda v: -v[1])[:max_servers]]
+
+    cli_set, svc_set, srv_set = set(top_cli), set(top_svc), set(top_srv)
+    filtered = {k: v for k, v in agg.items() if k[0] in cli_set and k[1] in svc_set and k[2] in srv_set}
+    if not filtered:
+        return go.Figure()
+
+    # --- Step 3: build node arrays with namespace prefixes ---
+    # Prefixes prevent Plotly from merging an IP that appears as both
+    # client and server into a single node.
+    all_keys: list[str] = []
+    labels: list[str] = []
+    colors: list[str] = []
+    x_pos: list[float] = []
+    y_pos: list[float] = []
+
+    def _add_column(items: list[str], prefix: str, x: float, color: str):
+        n = len(items)
+        for i, item in enumerate(items):
+            all_keys.append(f"{prefix}_{item}")
+            labels.append(item)
+            colors.append(color)
+            x_pos.append(x)
+            y_pos.append(0.02 + (i / max(n - 1, 1)) * 0.96 if n > 1 else 0.5)
+
+    _add_column(top_cli, "C", 0.01, "rgba(74, 144, 226, 0.85)")
+    _add_column(top_svc, "S", 0.48, "rgba(255, 169, 77, 0.85)")
+    _add_column(top_srv, "D", 0.99, "rgba(81, 207, 102, 0.85)")
+
+    key_idx = {k: i for i, k in enumerate(all_keys)}
+
+    # --- Step 4: build links (client→service, service→server) ---
+    hop1: Dict[tuple, int] = defaultdict(int)
+    hop2: Dict[tuple, int] = defaultdict(int)
+    for (cli, svc, srv), cnt in filtered.items():
+        hop1[(f"C_{cli}", f"S_{svc}")] += cnt
+        hop2[(f"S_{svc}", f"D_{srv}")] += cnt
+
+    link_src, link_tgt, link_val, link_clr = [], [], [], []
+    for (a, b), cnt in hop1.items():
+        link_src.append(key_idx[a])
+        link_tgt.append(key_idx[b])
+        link_val.append(cnt)
+        link_clr.append("rgba(74, 144, 226, 0.25)")
+    for (a, b), cnt in hop2.items():
+        link_src.append(key_idx[a])
+        link_tgt.append(key_idx[b])
+        link_val.append(cnt)
+        link_clr.append("rgba(81, 207, 102, 0.25)")
+
+    fig = go.Figure(data=[go.Sankey(
+        arrangement="fixed",
+        node=dict(
+            pad=18,
+            thickness=18,
+            line=dict(color="rgba(255,255,255,0.2)", width=0.5),
+            label=labels,
+            color=colors,
+            x=x_pos,
+            y=y_pos,
+        ),
+        link=dict(
+            source=link_src,
+            target=link_tgt,
+            value=link_val,
+            color=link_clr,
+        ),
+    )])
+
+    fig.update_layout(
+        title="Traffic Flow (Client → Service → Server)",
+        template="plotly_dark",
+        height=600,
+        margin=dict(l=10, r=10, t=50, b=20),
+        font=dict(size=10, color="#CCC"),
+    )
+    return fig
+

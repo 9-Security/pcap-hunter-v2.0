@@ -36,6 +36,7 @@ from app.ui.charts import (
     plot_flow_timeline,
     plot_network_graph,
     plot_protocol_distribution,
+    plot_sankey_flows,
     plot_top_n_charts,
     plot_world_map,
 )
@@ -1177,36 +1178,15 @@ with tab_dashboard:
     # --- New Dashboard Sections ---
     st.markdown("---")
 
-    # Correlation + Network graph side by side
+    # Sankey + Network graph side by side
     dash_col1, dash_col2 = st.columns(2)
     with dash_col1:
-        # Correlation results
-        render_correlation_results(st.container(), st.session_state.get("correlations"))
-
-        # Attack timeline (if available)
-        try:
-            from app.analysis.narrator import AttackNarrator
-
-            narrator = AttackNarrator()
-            timeline = narrator.create_timeline(
-                features=feats,
-                dns_analysis=st.session_state.get("dns_analysis"),
-                yara_results=st.session_state.get("yara_results"),
-                beacon_results=(
-                    get_df_state("beacon_df").to_dict("records")
-                    if not get_df_state("beacon_df").empty else []
-                ),
-                tls_analysis=st.session_state.get("tls_analysis"),
-            )
-            if timeline:
-                timeline_dicts = [e.to_dict() for e in timeline]
-                st.plotly_chart(
-                    plot_attack_timeline(timeline_dicts),
-                    use_container_width=True,
-                )
-                render_chart_hint("Diamond markers show events by severity and time.")
-        except Exception:
-            pass
+        # Sankey flow diagram
+        if filtered_flows:
+            sankey_fig = plot_sankey_flows(filtered_flows)
+            if sankey_fig.data:
+                st.plotly_chart(sankey_fig, use_container_width=True)
+                render_chart_hint("Source IP → Port (Protocol) → Destination IP. Width = packet volume.")
 
     with dash_col2:
         # Network graph
@@ -1221,6 +1201,31 @@ with tab_dashboard:
             if fig.data:
                 st.plotly_chart(fig, use_container_width=True)
                 render_chart_hint("Node size = connections. Color: blue=low, red=high threat.")
+
+    # Attack timeline (full-width, if available)
+    try:
+        from app.analysis.narrator import AttackNarrator
+
+        narrator = AttackNarrator()
+        timeline = narrator.create_timeline(
+            features=feats,
+            dns_analysis=st.session_state.get("dns_analysis"),
+            yara_results=st.session_state.get("yara_results"),
+            beacon_results=(
+                get_df_state("beacon_df").to_dict("records")
+                if not get_df_state("beacon_df").empty else []
+            ),
+            tls_analysis=st.session_state.get("tls_analysis"),
+        )
+        if timeline:
+            timeline_dicts = [e.to_dict() for e in timeline]
+            st.plotly_chart(
+                plot_attack_timeline(timeline_dicts),
+                use_container_width=True,
+            )
+            render_chart_hint("Diamond markers show events by severity and time.")
+    except Exception:
+        pass
 
     # --- Beaconing / YARA / TLS summaries on dashboard ---
     _beacon = get_df_state("beacon_df")
@@ -1270,6 +1275,11 @@ with tab_dashboard:
         else:
             with st.expander("TLS Certificate Risks (0)"):
                 st.caption("No TLS analysis data.")
+
+    st.markdown("---")
+
+    # Cross-Indicator Correlations (own section)
+    render_correlation_results(st.container(), st.session_state.get("correlations"))
 
     st.markdown("---")
 

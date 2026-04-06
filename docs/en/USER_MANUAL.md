@@ -12,12 +12,18 @@
    - [Data Ingestion (Upload)](#1-data-ingestion)
    - [Analysis Pipeline](#2-analysis-pipeline)
 3. [Analysis Dashboard](#analysis-dashboard)
+   - [Threat Summary Panel](#threat-summary-panel)
    - [Global Map & Filters](#global-map--filters)
+   - [Sankey Flow Diagram](#sankey-flow-diagram)
    - [Charts & Visualizations](#charts--visualizations)
    - [Top Metrics](#top-metrics)
+   - [Detection Panels](#detection-panels)
+   - [Cross-Indicator Correlation](#cross-indicator-correlation)
 4. [Advanced Features](#advanced-features)
    - [AI Threat Report](#ai-threat-report)
+   - [Multi-PCAP Batch Analysis](#multi-pcap-batch-analysis)
    - [OSINT Enrichment](#osint-enrichment)
+   - [Bulk Reverse DNS](#bulk-reverse-dns)
    - [Forensics (DNS, TLS, YARA, Carving)](#forensics)
 5. [Configuration](#configuration)
    - [LLM Setup](#llm-setup)
@@ -62,11 +68,15 @@ Ensure the following tools are installed on your system:
 Navigate to the **Load PCAP** tab to start.
 
 #### File Upload
-- **Drag & Drop**: Simply drag a `.pcap` or `.pcapng` file into the upload area.
+- **Single File**: Drag & drop a `.pcap` or `.pcapng` file into the upload area.
+- **Multiple Files**: Upload multiple PCAPs at once to enter **Batch Mode** with cross-file correlation. Limits: 50 files max, 1 GB per file, 5 GB total.
 - **Manual Path**: For large files (>200MB) that browsers struggle to upload, type the absolute path to the file on your disk (e.g., `/Users/name/capture.pcap`) and press Enter.
 
 ### 2. Analysis Pipeline
 By default, PCAP Hunter executes a complete analysis pipeline. You can customize which phases run (e.g., disable Zeek or Carving) in the **Config** tab under the **Extraction / Analysis** section.
+
+#### Parallel Execution
+The two heaviest stages — **PyShark packet parsing** and **Zeek log processing** — run concurrently via a thread pool, significantly reducing total analysis time. HTTP carving also runs in parallel with DNS/TLS/Beaconing analysis.
 
 Click **Extract & Analyze** to begin. Monitor progress in the **Progress** tab.
 
@@ -76,6 +86,16 @@ Click **Extract & Analyze** to begin. Monitor progress in the **Progress** tab.
 
 The **Dashboard** tab is your central mission control.
 
+### Threat Summary Panel
+At the top of the dashboard, a panel displays five key metrics at a glance:
+- **Risk Level** — Overall threat assessment (Critical / High / Medium / Low) based on corroboration across multiple signal categories.
+- **Total Alerts** — Number of indicators flagged by the correlation engine.
+- **Beacon Candidates** — Flows exhibiting C2-like periodic communication patterns.
+- **YARA Hits** — Files matching YARA rule signatures.
+- **Cert Issues** — TLS certificates with problems (self-signed, expired, or untrusted chains).
+
+The risk level requires **corroboration from 2+ signal categories** to escalate to Medium, and YARA or high-confidence OSINT signals for High/Critical — preventing false positives from single weak signals.
+
 ### Global Map & Filters
 - **Interactive World Map**: Visualizes the geographic destination of your traffic.
   - **Selection**: Use **Box Select** or **Lasso Select** tools to highlight a region. This **cross-filters** the entire dashboard (charts, tables, timeline) to show only traffic relevant to that area.
@@ -84,17 +104,38 @@ The **Dashboard** tab is your central mission control.
   - **Exclude Private IPs**: Toggle this checkbox to hide RFC1918 (local LAN) traffic from the map and "Top 10" charts. This helps focus on external threats.
   - **Clear All Filters**: Instantly resets the dashboard view, clearing IP, protocol, and time selections.
 
+### Sankey Flow Diagram
+Displayed alongside the Network Communication Graph, the **Sankey diagram** visualizes traffic flows in three columns:
+- **Left**: Client (source) IPs
+- **Middle**: Service ports with human-readable protocol labels (e.g., "443 (HTTPS)", "53 (DNS)")
+- **Right**: Server (destination) IPs
+
+The diagram automatically normalizes flow direction: the side using a well-known port (< 10000) is treated as the server. Ephemeral ports (>= 10000) are excluded to keep the visualization clean and focused on meaningful service connections.
+
 ### Charts & Visualizations
 - **Protocol Distribution**: A pie chart showing protocol breakdown (TCP, UDP, TLS, HTTP, etc.). Click a slice to filter the dashboard by that protocol.
 - **Flow Timeline**: A time-series chart showing traffic volume over time.
   - **Zoom**: Click and drag to create a time window. The dashboard will update to show only traffic from that specific period.
+- **Network Communication Graph**: Force-directed graph with threat-colored nodes and equal-aspect-ratio rendering.
 
 ### Top Metrics
 - **Top 10 Tables**: Tables and bar charts displaying the most active:
-  - **Source IPs**
-  - **Destination IPs**
+  - **Source IPs** (with reverse DNS hostnames)
+  - **Destination IPs** (with reverse DNS hostnames)
   - **Destination Ports**
   - **Protocols** or **Domains**
+
+### Detection Panels
+The dashboard surfaces key detection results directly:
+- **Beaconing Candidates** — Flows scoring above the C2 threshold (0.6+), with periodicity and jitter details.
+- **YARA Matches** — Files carved from HTTP traffic that matched YARA rules.
+- **TLS Certificate Risks** — Expired, self-signed, or untrusted certificates detected in SSL/TLS traffic.
+
+### Cross-Indicator Correlation
+A dedicated section displays the **correlation engine's composite threat scores** for each indicator:
+- Uses an **independence-complement formula** (`1 − Π(1 − wᵢsᵢ)`) to combine signals from OSINT, beaconing, DNS, TLS, YARA, and flow analysis.
+- Indicators are classified as **Critical**, **High**, **Medium**, or **Low** with supporting signal breakdowns.
+- Strong-signal floors ensure that a confirmed VirusTotal detection automatically sets a minimum score.
 
 ---
 
@@ -102,7 +143,9 @@ The **Dashboard** tab is your central mission control.
 
 ### AI Threat Report
 Located in the **LLM Analysis** tab.
-- **Professional Narrative**: The AI synthesizes a coherent story of the network activity, rather than just listing logs.
+- **Structured Analysis Workflow**: The AI follows a professional methodology: Characterize → Identify → Assess → Recommend.
+- **Severity Calibration**: The LLM is guided by examples for each severity level, with built-in false-positive awareness to avoid over-rating benign traffic.
+- **Pre-Computed Context**: The report receives pre-computed correlation verdicts, risk distributions, and top threats — ensuring the AI narrative aligns with the quantitative analysis.
 - **Sections**: Includes Executive Summary, Key Findings, Indicators of Compromise (IOCs), Risk Assessment, and Recommended Actions.
 - **PDF Export**: Click **Generate PDF Report** to download a formatted report. The PDF includes:
   - Cover Page with classification (TLP:CLEAR).
@@ -111,11 +154,24 @@ Located in the **LLM Analysis** tab.
   - YARA Scan results.
   - TLS Analysis (expired/self-signed certs).
 
+### Multi-PCAP Batch Analysis
+Upload multiple PCAP files at once to enable batch mode:
+- **Per-File Analysis**: Each file runs through the full 10-stage pipeline independently.
+- **Cross-File Correlation**: After individual analysis, the engine detects shared indicators (IPs, domains, JA3 fingerprints) across files — revealing coordinated activity or persistent threats.
+- **Batch Summary**: Aggregated metrics and per-file detail cards are displayed in the dashboard.
+- **Resource Limits**: Configurable via `app/config.py` — default 50 files max, 1 GB per file, 5 GB total.
+
 ### OSINT Enrichment
 Located in the **OSINT** tab.
 - **IP Intelligence**: Displays reputation scores from VirusTotal, GreyNoise (noise vs. malicious), and PTR records.
 - **Domain Intelligence**: Categories and reputation for queried domains.
 - **WHOIS**: Click on an IP or Domain to view registration details in a popup.
+
+### Bulk Reverse DNS
+PCAP Hunter automatically performs **bulk reverse DNS (rDNS) resolution** for all public IPs observed in the traffic:
+- Parallel resolution via ThreadPoolExecutor for speed.
+- Results cached in a dedicated **SQLite database** with a 7-day TTL to avoid redundant lookups.
+- Resolved hostnames are displayed throughout the dashboard in Top 10 tables, correlation results, and OSINT views.
 
 ### Forensics
 - **DNS Analysis**:
@@ -151,8 +207,9 @@ Enter your API keys to enable enrichment. Keys are saved securely in your local 
 ### Extraction / Analysis
 Enable or disable specific pipeline steps to speed up analysis or skip unnecessary processing:
 - **PyShark Parsing**: Deep packet inspection (Required for flow charts).
-- **Packet Limit**: Max packets to parse (Default: 200,000) to prevents memory exhaustion.
+- **Packet Limit**: Max packets to parse (Default: 200,000) to prevent memory exhaustion.
 - **Zeek Processing**: Toggles Zeek log generation.
+- **Parallel Execution**: When both PyShark and Zeek are enabled, they run concurrently (enabled by default).
 - **Carve HTTP bodies**: Extracts files from HTTP traffic.
 - **YARA Scan**: Scans carved files (requires Carving to be enabled).
 - **Pre-count packets**: Counts total packets before parsing.
@@ -185,4 +242,4 @@ Granular controls to manage disk usage:
   - Requires the `pango` library. Run: `brew install pango`.
 
 ---
-*PCAP Hunter v0.5.1-alpha*
+*PCAP Hunter v0.6.0-alpha*

@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0-alpha] - 2026-04-07
+
+### Added
+- **Parallel Pipeline Execution**:
+    - PyShark packet parsing and Zeek log processing now run concurrently via `ThreadPoolExecutor`.
+    - HTTP carving runs in parallel with DNS/TLS/Beaconing analysis.
+    - Tshark `-c` flag optimization enforces packet limits at the tshark level for zero-waste I/O.
+    - Configurable via `PARALLEL_PARSE_ENABLED` and `MAX_PARALLEL_WORKERS` in `app/config.py`.
+- **Multi-PCAP Batch Upload**:
+    - Upload and analyze multiple PCAP files simultaneously with automatic batch mode detection.
+    - Cross-file correlation detects shared IPs, domains, and JA3 fingerprints across files.
+    - Per-file summary cards and aggregated batch metrics in the dashboard.
+    - Resource limits: 50 files max, 1 GB per file, 5 GB total (configurable).
+- **Bulk Reverse DNS Resolution**:
+    - Parallel rDNS resolution for all public IPs via ThreadPoolExecutor.
+    - Dedicated SQLite cache with 7-day TTL to avoid redundant lookups.
+    - Resolved hostnames displayed throughout the dashboard (Top 10 tables, correlation, OSINT).
+- **Threat Summary Panel**:
+    - Five-metric panel at the top of the dashboard: Risk Level, Total Alerts, Beacon Candidates, YARA Hits, and Cert Issues.
+    - Corroboration-based escalation: requires 2+ signal categories for Medium; YARA or high-confidence OSINT for High/Critical.
+- **Sankey Flow Diagram**:
+    - Client IP → Service Port → Server IP flow visualization alongside the network communication graph.
+    - Automatic flow normalization: well-known port side (< 10000) determines server direction.
+    - Ephemeral ports (>= 10000) excluded; namespaced nodes prevent cross-column merging.
+    - Human-readable port labels (e.g., "443 (HTTPS)", "53 (DNS)").
+- **Dashboard Detection Panels**:
+    - Beaconing candidates (0.6+ threshold), YARA matches, and TLS certificate risks surfaced directly on the dashboard.
+- **Cross-Indicator Correlation Section**:
+    - Dedicated dashboard section for the correlation engine's composite threat scores.
+
+### Changed
+- **Threat Scoring Overhaul**:
+    - Replaced linear summation with independence-complement formula (`1 − Π(1 − wᵢsᵢ)`) for composite scoring.
+    - Introduced tiered signal architecture: Tier 1 (OSINT definitive), Tier 2 (behavioral), Tier 3 (contextual).
+    - Added strong-signal floors: confirmed VirusTotal detections set minimum score regardless of other factors.
+    - Tier 3 signals alone capped at "medium" severity.
+- **Beacon False-Positive Reduction**:
+    - Infrastructure allowlist (1.1.1.1, 8.8.8.8, 9.9.9.9, etc.) applies ×0.15 penalty.
+    - Protocol awareness: ICMP, NTP, mDNS, SSDP, IGMP flagged as inherently periodic (×0.2).
+    - Service port penalties: HTTPS (×0.5), IMAPS (×0.2), Apple Push (×0.2), MQTT (×0.3).
+    - High-volume large-payload filter (×0.3 when >200 packets + >500 avg bytes).
+- **LLM Report Generation**:
+    - Restructured system instructions: Characterize → Identify → Assess → Recommend workflow.
+    - Added severity calibration guide with concrete examples per severity level.
+    - Built-in false-positive awareness section to prevent over-rating benign traffic.
+    - Pre-computed correlation verdicts, risk distributions, and top threats passed to LLM context.
+- **Dashboard Layout**:
+    - Sankey diagram placed alongside the network communication graph.
+    - Correlation moved from inline display to its own dedicated section.
+    - Beacon display threshold raised from 0.5 to 0.6.
+
+### Fixed
+- **Test Suite**: Updated test IPs from infrastructure-allowlisted addresses (1.1.1.1) to private ranges (10.0.0.1) to prevent false test failures.
+- **Lint Issues**: Resolved pre-existing E501, F841, unused import, and import sorting issues across multiple modules.
+
 ## [0.5.1-alpha] - 2026-01-05
 
 ### Added

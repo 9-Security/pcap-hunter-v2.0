@@ -1,6 +1,6 @@
 
-import pytest
 from app.utils import geo_data
+
 
 def test_load_geo_data():
     """Verify data is loaded correctly."""
@@ -45,7 +45,7 @@ def test_get_location_details():
     assert isinstance(lon, float)
     assert lat != 0.0
     assert lon != 0.0
-    
+
     # Test non-existent
     lat, lon = geo_data.get_location_details('NonExistentCity', 'NoCountry')
     assert lat == 0.0

@@ -19,8 +19,30 @@ class LiveCapture:
         self.process: Optional[subprocess.Popen] = None
         self.start_time: float = 0
 
+    @staticmethod
+    def _validate_interface(interface: str) -> None:
+        """Validate the interface name to prevent command injection.
+
+        Args:
+            interface: Network interface name
+
+        Raises:
+            ValueError: If the interface name is invalid
+        """
+        if not interface or interface.startswith("-"):
+            raise ValueError(f"Invalid interface name: {interface!r}")
+
+        # If we can enumerate interfaces, validate against the list
+        available = list_interfaces()
+        if available and interface not in available:
+            raise ValueError(
+                f"Interface {interface!r} not found. Available: {', '.join(available)}"
+            )
+
     def start(self):
         """Starts the tshark capture."""
+        self._validate_interface(self.interface)
+
         tshark_path = find_bin("tshark", cfg_key="cfg_tshark_bin")
         if not tshark_path:
             raise RuntimeError("Tshark binary not found.")
@@ -40,7 +62,7 @@ class LiveCapture:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                preexec_fn=os.setsid,  # Create a new process group to kill it safely
+                start_new_session=True,  # Create a new process group to kill it safely
             )
             self.start_time = time.time()
 

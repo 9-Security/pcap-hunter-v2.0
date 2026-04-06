@@ -52,6 +52,10 @@ def parse_pcap_pyshark(
     # Add packet length field
     cmd.extend(["-e", "frame.len"])
 
+    # Tell tshark to stop after N packets (avoids reading entire PCAP when limited)
+    if limit_packets:
+        cmd.extend(["-c", str(limit_packets)])
+
     out = {
         "flows": [],
         "artifacts": {"ips": set(), "domains": set(), "urls": set(), "hashes": set(), "ja3": set(), "macs": set()},
@@ -61,7 +65,7 @@ def parse_pcap_pyshark(
 
     try:
         # Use Popen to stream output line by line
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=65536)
         try:
             for line in proc.stdout:
                 if phase and phase.should_skip():

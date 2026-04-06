@@ -1,20 +1,26 @@
+class CarveError(Exception):
+    """Raised when HTTP payload carving fails."""
+
+
 def carve_http_payloads(pcap_path: str, out_dir: str, phase=None) -> list[dict]:
     import hashlib
+    import logging
     import pathlib
     import subprocess
 
     from app.utils.common import find_bin
-    from app.utils.logger import log_runtime_error
+
+    logger = logging.getLogger(__name__)
 
     pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     tshark_bin = find_bin("tshark", cfg_key="cfg_tshark_bin")
     if not tshark_bin:
         msg = "Tshark binary not found for carving."
-        log_runtime_error(msg)
+        logger.warning(msg)
         if phase:
             phase.done("Tshark missing.")
-        return [{"_error": msg}]
+        raise CarveError(msg)
 
     if phase and phase.should_skip():
         phase.done("HTTP carving skipped.")
@@ -46,7 +52,7 @@ def carve_http_payloads(pcap_path: str, out_dir: str, phase=None) -> list[dict]:
     except Exception as e:
         if phase:
             phase.done("tshark failed.")
-        return [{"_error": f"tshark exec failed: {e}"}]
+        raise CarveError(f"tshark exec failed: {e}") from e
 
     results = []
     lines = proc.stdout.splitlines()
@@ -58,16 +64,17 @@ def carve_http_payloads(pcap_path: str, out_dir: str, phase=None) -> list[dict]:
         if len(parts) < 5:
             continue
         ts, stream_id, ctype, clen, body = parts[:5]
-        try:
-            data_bytes = body.encode("utf-8", "ignore")
-        except Exception:
-            data_bytes = body.encode("latin1", "ignore")
+        if isinstance(body, str):
+            data_bytes = body.encode("utf-8", "surrogateescape")
+        else:
+            data_bytes = body
         h = hashlib.sha256(data_bytes).hexdigest()
         fname = f"stream{stream_id}_{h[:10]}.bin"
         fpath = pathlib.Path(out_dir) / fname
         try:
             fpath.write_bytes(data_bytes)
-        except Exception:
+        except OSError as e:
+            logger.warning("Failed to write carved file %s: %s", fpath, e)
             continue
         results.append(
             {

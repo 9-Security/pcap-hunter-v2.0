@@ -161,7 +161,7 @@ class OSINTCache:
 
         return None
 
-    def set(self, indicator: str, provider: str, data: dict) -> None:
+    def set(self, indicator: str, provider: str, data: dict, *, commit: bool = True) -> None:
         """
         Store response in cache.
 
@@ -169,6 +169,9 @@ class OSINTCache:
             indicator: IP address, domain, or hash
             provider: OSINT provider name
             data: Response data to cache
+            commit: Whether to commit immediately (default True).
+                Set to False when batching multiple writes, then call
+                ``flush()`` or ``set_batch()`` to commit once.
         """
         if not self.enabled:
             return
@@ -181,6 +184,36 @@ class OSINTCache:
                 """,
                 (indicator.lower(), provider.lower(), json.dumps(data), time.time()),
             )
+            if commit:
+                conn.commit()
+
+    def set_batch(self, entries: list[tuple[str, str, dict]]) -> None:
+        """
+        Store multiple responses in cache with a single commit.
+
+        Args:
+            entries: List of (indicator, provider, data) tuples to cache.
+        """
+        if not self.enabled or not entries:
+            return
+
+        now = time.time()
+        with self._get_conn() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO osint_cache (indicator, provider, data, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (indicator.lower(), provider.lower(), json.dumps(data), now)
+                    for indicator, provider, data in entries
+                ],
+            )
+            conn.commit()
+
+    def flush(self) -> None:
+        """Commit any pending writes from ``set(..., commit=False)`` calls."""
+        with self._get_conn() as conn:
             conn.commit()
 
     def invalidate(self, indicator: str | None = None, provider: str | None = None) -> int:

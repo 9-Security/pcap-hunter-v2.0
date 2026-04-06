@@ -1,15 +1,59 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
-
 import numpy as np
 import pandas as pd
 
+# Well-known infrastructure IPs that generate periodic traffic by design.
+# Beacon scores for flows to these destinations are heavily penalised.
+INFRA_ALLOWLIST = frozenset(
+    {
+        # Public DNS resolvers
+        "1.1.1.1", "1.0.0.1",              # Cloudflare
+        "8.8.8.8", "8.8.4.4",              # Google
+        "208.67.222.222", "208.67.220.220", # OpenDNS
+        "9.9.9.9", "149.112.112.112",       # Quad9
+        "168.95.1.1", "168.95.192.1",       # HiNet (Taiwan)
+        # NTP pools (common)
+        "129.6.15.28", "129.6.15.29",       # NIST
+        "132.163.97.1", "132.163.96.1",
+    }
+)
 
-def periodicity_score(ts: List[float]) -> Dict[str, Any]:
-    if not ts or len(ts) < 6:
+# Protocols that are inherently periodic (health-checks, keep-alives)
+# and should be penalised in beacon scoring.
+BENIGN_PERIODIC_PROTOS = frozenset({"icmp", "ntp", "ssdp", "mdns", "igmp"})
+
+# Destination ports for services that maintain persistent/periodic connections
+# by design.  Multiplier applied to raw beacon score.
+BENIGN_SERVICE_PORTS: dict[str, float] = {
+    "53": 0.3,      # DNS
+    "123": 0.3,     # NTP
+    "443": 0.5,     # HTTPS/QUIC — most legitimate traffic; still allows very strong C2 to surface
+    "993": 0.2,     # IMAPS — periodic IDLE keep-alives
+    "995": 0.2,     # POP3S
+    "5223": 0.2,    # Apple Push Notification
+    "5228": 0.2,    # Google Play / FCM push
+    "1883": 0.3,    # MQTT (IoT)
+    "8883": 0.3,    # MQTT over TLS
+    "5060": 0.3,    # SIP
+    "5061": 0.3,    # SIP-TLS
+    "5353": 0.3,    # mDNS
+}
+
+
+def periodicity_score(ts: list[float]) -> dict[str, object]:
+    """Score timestamp periodicity for beaconing detection.
+
+    Args:
+        ts: Timestamps, must be pre-sorted ascending when called from
+            rank_beaconing.  Falls back to sorting internally otherwise.
+
+    Returns:
+        Dict with count, mean_gap, std_gap, cv, entropy, and score.
+    """
+    if not ts or len(ts) < 3:
         return {"count": len(ts), "mean_gap": None, "std_gap": None, "cv": None, "entropy": None, "score": 0.0}
-    ts = sorted(ts)
+    # Caller (rank_beaconing) provides pre-sorted timestamps; no re-sort needed.
     gaps = np.diff(ts)
     if len(gaps) == 0:
         return {"count": len(ts), "mean_gap": 0, "std_gap": 0, "cv": 0, "entropy": 0, "score": 0.0}
@@ -20,7 +64,15 @@ def periodicity_score(ts: List[float]) -> Dict[str, Any]:
     probs = bins / bins.sum() if bins.sum() > 0 else np.array([1.0])
     entropy = float(-np.sum([p * np.log2(p) for p in probs if p > 0]))
     score = (1.0 - min(cv or 1.0, 1.0)) * 0.6 + (1.0 - min(entropy / 4.0, 1.0)) * 0.4
-    score *= min(len(ts) / 50.0, 1.0)
+
+    # Softer volume scaling: small sample counts are penalised less so that
+    # infrequent but regular beacons (e.g. daily C2 check-ins) still surface.
+    # 3-5 packets  → 0.3-0.5 multiplier  (was 0.06-0.10 previously)
+    # 6-9 packets  → 0.5-0.7
+    # 10-20        → 0.7-0.9
+    # 20+          → ~1.0
+    score *= min(len(ts) / 20.0, 1.0) * 0.7 + 0.3
+
     return {
         "count": len(ts),
         "mean_gap": mean_gap,
@@ -31,23 +83,142 @@ def periodicity_score(ts: List[float]) -> Dict[str, Any]:
     }
 
 
-def rank_beaconing(flows: List[Dict[str, Any]], top_n=20) -> pd.DataFrame:
+def jitter_score(ts: list[float]) -> dict[str, object]:
+    """Score beaconing with jitter tolerance via modal interval analysis.
+
+    Finds the dominant inter-packet interval and scores based on what
+    fraction of gaps fall within +-20% of it.  Catches C2 channels that
+    add random jitter to evade simple CV-based checks.
+
+    Args:
+        ts: Timestamps, must be pre-sorted ascending when called from
+            rank_beaconing.  Falls back to sorting internally otherwise.
+
+    Returns:
+        Dict with jitter_score, dominant_interval, jitter_pct, consistent_ratio.
+    """
+    if not ts or len(ts) < 5:
+        return {
+            "jitter_score": 0.0,
+            "dominant_interval": None,
+            "jitter_pct": None,
+            "consistent_ratio": None,
+        }
+
+    # Caller (rank_beaconing) provides pre-sorted timestamps; no re-sort needed.
+    gaps = np.diff(ts)
+    if len(gaps) == 0 or float(np.max(gaps)) == 0:
+        return {
+            "jitter_score": 0.0,
+            "dominant_interval": 0,
+            "jitter_pct": 0,
+            "consistent_ratio": 0,
+        }
+
+    # Find dominant interval via histogram peak
+    n_bins = min(50, max(10, len(gaps) // 3))
+    counts, edges = np.histogram(gaps, bins=n_bins)
+    peak_bin = int(np.argmax(counts))
+    dominant_interval = float((edges[peak_bin] + edges[peak_bin + 1]) / 2)
+
+    if dominant_interval <= 0:
+        return {
+            "jitter_score": 0.0,
+            "dominant_interval": 0,
+            "jitter_pct": 0,
+            "consistent_ratio": 0,
+        }
+
+    # Count gaps within +-20% of dominant interval
+    tolerance = dominant_interval * 0.2
+    lo, hi = dominant_interval - tolerance, dominant_interval + tolerance
+    consistent = int(np.sum((gaps >= lo) & (gaps <= hi)))
+    consistent_ratio = consistent / len(gaps)
+
+    # Jitter percentage
+    consistent_gaps = gaps[(gaps >= lo) & (gaps <= hi)]
+    if len(consistent_gaps) > 1:
+        jitter_pct = float(np.std(consistent_gaps) / dominant_interval * 100)
+    else:
+        jitter_pct = 0.0
+
+    score = consistent_ratio * 0.7 + (1.0 - min(jitter_pct / 30, 1.0)) * 0.3
+
+    # Same volume scaling as periodicity_score
+    score *= min(len(ts) / 20.0, 1.0) * 0.7 + 0.3
+
+    return {
+        "jitter_score": float(score),
+        "dominant_interval": round(dominant_interval, 2),
+        "jitter_pct": round(jitter_pct, 1),
+        "consistent_ratio": round(consistent_ratio, 3),
+    }
+
+
+def rank_beaconing(flows: list[dict[str, object]], top_n: int = 20) -> pd.DataFrame:
+    """Rank network flows by beaconing likelihood.
+
+    Args:
+        flows: List of flow dicts, each containing 'pkt_times' and flow metadata.
+        top_n: Number of top results to return.
+
+    Returns:
+        DataFrame of top beaconing candidates sorted by score descending.
+    """
     rows = []
     for f in flows:
-        stats = periodicity_score(f.get("pkt_times", []))
+        # Sort timestamps once; both scoring functions accept pre-sorted input.
+        ts = sorted(f.get("pkt_times", []))
+        if len(ts) < 2:
+            continue
+        stats = periodicity_score(ts)
+        jitter = jitter_score(ts)
+        # Use the higher of the two scores
+        final_score = max(stats["score"], jitter["jitter_score"])
+
+        # --- False-positive reduction ---
+        dst = f.get("dst", "")
+        src = f.get("src", "")
+        proto = (f.get("proto") or "").lower()
+        dport = str(f.get("dport", ""))
+
+        # --- False-positive penalties (multiplicative, stack) ---
+
+        # 1. Well-known infrastructure IPs (DNS resolvers, NTP servers)
+        if dst in INFRA_ALLOWLIST or src in INFRA_ALLOWLIST:
+            final_score *= 0.15
+
+        # 2. Inherently periodic protocols (ICMP pings, NTP, mDNS, etc.)
+        if proto in BENIGN_PERIODIC_PROTOS:
+            final_score *= 0.2
+
+        # 3. Benign service ports (HTTPS, IMAPS, Apple Push, MQTT, etc.)
+        if dport in BENIGN_SERVICE_PORTS:
+            final_score *= BENIGN_SERVICE_PORTS[dport]
+
+        # 4. High-volume large-payload flows (streaming/downloads, not C2)
+        #    Real C2 beacons are small, infrequent packets.
+        pkt_lens = f.get("pkt_lens", [])
+        if pkt_lens and len(ts) > 200:
+            avg_pkt_size = sum(pkt_lens) / len(pkt_lens)
+            if avg_pkt_size > 500:
+                final_score *= 0.3
+
         rows.append(
             {
                 "src": f.get("src"),
-                "dst": f.get("dst"),
+                "dst": dst,
                 "sport": f.get("sport"),
-                "dport": f.get("dport"),
+                "dport": dport,
                 "proto": f.get("proto"),
                 "pkts": stats["count"],
                 "mean_gap": stats["mean_gap"],
                 "std_gap": stats["std_gap"],
                 "cv": stats["cv"],
                 "entropy": stats["entropy"],
-                "score": stats["score"],
+                "score": round(final_score, 4),
+                "dominant_interval": jitter["dominant_interval"],
+                "jitter_pct": jitter["jitter_pct"],
             }
         )
     df = pd.DataFrame(rows)

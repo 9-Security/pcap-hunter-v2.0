@@ -8,7 +8,7 @@ try:
     import weasyprint  # noqa: F401
 
     WEASYPRINT_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     WEASYPRINT_AVAILABLE = False
 
 from app.reports.pdf_generator import (

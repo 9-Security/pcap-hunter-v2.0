@@ -240,7 +240,7 @@ class TestIOCScorer:
             "data_volume": 50_000_000,
         }
         scored = scorer.score_ioc("1.2.3.4", "ip", behavioral_data=behavioral)
-        assert scored.priority_score > 0.2
+        assert scored.priority_score > 0.15  # Adjusted for expanded weight distribution
 
     def test_priority_labels(self):
         scorer = IOCScorer()

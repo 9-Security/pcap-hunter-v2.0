@@ -1,15 +1,119 @@
 from __future__ import annotations
 
+import concurrent.futures
 import ipaddress
+import logging
+import re
 import socket
+import urllib.parse
+
+logger = logging.getLogger(__name__)
+
+# Default timeout for individual rDNS lookups (seconds)
+_RDNS_TIMEOUT = 2.0
+
+# Save and restore the default socket timeout so we only modify it
+# inside our own call.
+_orig_timeout = socket.getdefaulttimeout()
 
 
-def resolve_ip(ip: str) -> str | None:
-    """Resolve IP to domain name (Reverse DNS)."""
+def resolve_ip(ip: str, timeout: float = _RDNS_TIMEOUT) -> str | None:
+    """Resolve IP to domain name (Reverse DNS) with a timeout."""
     try:
-        return socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror, OSError):
+        old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        finally:
+            socket.setdefaulttimeout(old)
+    except (socket.herror, socket.gaierror, OSError, socket.timeout):
         return None
+
+
+def bulk_resolve_ips(
+    ips: list[str],
+    max_workers: int = 10,
+    use_cache: bool = True,
+) -> dict[str, str]:
+    """Resolve many IPs to hostnames in parallel, with caching.
+
+    Args:
+        ips: List of IP address strings (public IPs only are meaningful).
+        max_workers: Thread pool size.
+        use_cache: Whether to check/store in the rDNS SQLite cache.
+
+    Returns:
+        ``{ip: hostname}`` for every IP that resolved successfully.
+    """
+    if not ips:
+        return {}
+
+    unique_ips = list(set(ips))
+    result: dict[str, str] = {}
+
+    # Check cache first
+    uncached: list[str] = unique_ips
+    if use_cache:
+        try:
+            from app.pipeline.rdns_cache import get_rdns_cache
+
+            cache = get_rdns_cache()
+            cached = cache.get_batch(unique_ips)
+            result.update(cached)
+            uncached = [ip for ip in unique_ips if ip not in cached]
+        except Exception:
+            pass  # cache unavailable — resolve everything
+
+    if not uncached:
+        return result
+
+    # Resolve uncached IPs in parallel
+    new_entries: list[tuple[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(uncached))) as executor:
+        future_to_ip = {executor.submit(resolve_ip, ip): ip for ip in uncached}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                hostname = future.result()
+                if hostname:
+                    result[ip] = hostname
+                    new_entries.append((ip, hostname))
+            except Exception:
+                pass
+
+    # Store new resolutions in cache
+    if use_cache and new_entries:
+        try:
+            from app.pipeline.rdns_cache import get_rdns_cache
+
+            get_rdns_cache().set_batch(new_entries)
+        except Exception:
+            pass
+
+    logger.info("rDNS resolved %d/%d IPs (%d cached)", len(result), len(unique_ips), len(unique_ips) - len(uncached))
+    return result
+
+
+def _validate_domain(domain: str) -> bool:
+    """
+    Validate a domain name to prevent SSRF and injection attacks.
+
+    Args:
+        domain: Domain string to validate
+
+    Returns:
+        True if domain appears valid, False otherwise
+    """
+    if not domain or len(domain) > 253:
+        return False
+    # Must contain at least one dot
+    if "." not in domain:
+        return False
+    # Only allow valid domain characters
+    pattern = r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+    if not re.match(pattern, domain):
+        return False
+    return True
 
 
 def get_whois_info(target: str) -> dict | str:
@@ -18,14 +122,14 @@ def get_whois_info(target: str) -> dict | str:
     For IPs, uses RDAP (Registration Data Access Protocol).
     For domains, uses whois library.
     """
-    import whois
     import requests
+    import whois
 
     try:
         if is_public_ipv4(target):
-            # RDAP Lookup for IPs
-            # Using ARIN's bootstrap service as a proxy or just common rdap.net
-            url = f"https://rdap.arin.net/registry/ip/{target}"
+            # RDAP Lookup for IPs — URL-encode the target to prevent injection
+            safe_target = urllib.parse.quote(target, safe="")
+            url = f"https://rdap.arin.net/registry/ip/{safe_target}"
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
                 data = r.json()
@@ -52,20 +156,23 @@ def get_whois_info(target: str) -> dict | str:
                     emails = [item[3] for item in vcard if item[0] == "email"]
                     if emails:
                         res["emails"] = emails
-                
+
                 # Try to get events (created/updated)
                 events = data.get("events", [])
                 for ev in events:
                     if ev.get("eventAction") == "registration":
                         res["creation_date"] = ev.get("eventDate")
                     elif ev.get("eventAction") == "last changed":
-                        res["expiration_date"] = ev.get("eventDate") # Using as 'last updated/expires' proxy
-                
+                        res["expiration_date"] = ev.get("eventDate")  # Using as 'last updated/expires' proxy
+
                 return res
             else:
                 return f"RDAP lookup failed (HTTP {r.status_code})"
-        
-        # Domain Lookup
+
+        # Domain Lookup — validate before making the request
+        if not _validate_domain(target):
+            return {"error": f"Invalid domain name: {target}"}
+
         w = whois.whois(target)
         if hasattr(w, "text"):
             return w

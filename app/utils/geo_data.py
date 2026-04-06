@@ -1,8 +1,8 @@
 
 import json
-import os
-import streamlit as st
 from pathlib import Path
+
+import streamlit as st
 
 # Path to the data file relative to this file
 DATA_PATH = Path(__file__).parent.parent / "assets" / "world_cities.json"

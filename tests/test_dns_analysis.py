@@ -6,6 +6,8 @@ import pytest
 from app.pipeline.dns_analysis import (
     DNSRecord,
     analyze_dns,
+    analyze_nxdomain,
+    analyze_query_velocity,
     calculate_consonant_ratio,
     calculate_digit_ratio,
     calculate_entropy,
@@ -296,3 +298,85 @@ class TestAnalyzeDNS:
         assert "query_types" in result
         assert "dga_detections" in result
         assert "alerts" in result
+        # New: NXDOMAIN and query velocity results
+        assert "nxdomain_analysis" in result
+        assert "query_velocity" in result
+
+
+class TestNXDOMAINAnalysis:
+    """Test NXDOMAIN ratio analysis."""
+
+    def test_no_nxdomain(self):
+        records = [
+            DNSRecord(ts=1.0, src="10.0.0.1", dst="8.8.8.8",
+                      query="example.com", qtype="A", rcode="NOERROR"),
+        ]
+        result = analyze_nxdomain(records)
+        assert result["nxdomain_count"] == 0
+        assert result["nxdomain_ratio"] == 0.0
+        assert result["is_suspicious"] is False
+
+    def test_high_nxdomain(self):
+        records = []
+        for i in range(70):
+            records.append(DNSRecord(
+                ts=float(i), src="10.0.0.1", dst="8.8.8.8",
+                query=f"random{i}.com", qtype="A", rcode="NXDOMAIN",
+            ))
+        for i in range(30):
+            records.append(DNSRecord(
+                ts=float(i + 70), src="10.0.0.1", dst="8.8.8.8",
+                query="google.com", qtype="A", rcode="NOERROR",
+            ))
+        result = analyze_nxdomain(records)
+        assert result["nxdomain_count"] == 70
+        assert result["nxdomain_ratio"] == 0.7
+        assert result["is_suspicious"] is True
+        assert len(result["sources"]) >= 1
+
+    def test_empty_records(self):
+        result = analyze_nxdomain([])
+        assert result["nxdomain_count"] == 0
+
+    def test_per_source_breakdown(self):
+        records = [
+            DNSRecord(ts=1.0, src="10.0.0.1", dst="8.8.8.8",
+                      query="bad.com", qtype="A", rcode="NXDOMAIN"),
+            DNSRecord(ts=2.0, src="10.0.0.1", dst="8.8.8.8",
+                      query="ok.com", qtype="A", rcode="NOERROR"),
+            DNSRecord(ts=3.0, src="10.0.0.2", dst="8.8.8.8",
+                      query="fine.com", qtype="A", rcode="NOERROR"),
+        ]
+        result = analyze_nxdomain(records)
+        # 10.0.0.1 has 50% NXDOMAIN - should appear in sources
+        assert any(s["src"] == "10.0.0.1" for s in result["sources"])
+
+
+class TestQueryVelocity:
+    """Test DNS query velocity analysis."""
+
+    def test_empty_records(self):
+        result = analyze_query_velocity([])
+        assert result == []
+
+    def test_low_velocity(self):
+        # 10 queries over 100 seconds = 0.1 qps
+        records = [
+            DNSRecord(ts=float(i * 10), src="10.0.0.1", dst="8.8.8.8",
+                      query="example.com", qtype="A")
+            for i in range(10)
+        ]
+        result = analyze_query_velocity(records)
+        assert len(result) == 0  # Below threshold
+
+    def test_high_velocity(self):
+        # 200 queries over 2 seconds = 100 qps
+        records = [
+            DNSRecord(ts=i * 0.01, src="10.0.0.1", dst="8.8.8.8",
+                      query=f"q{i}.example.com", qtype="A")
+            for i in range(200)
+        ]
+        result = analyze_query_velocity(records)
+        assert len(result) >= 1
+        assert result[0]["is_suspicious"] is True
+        assert result[0]["qps"] > 50

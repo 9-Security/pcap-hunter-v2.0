@@ -40,18 +40,21 @@ class ScoredIOC:
 
 # Default scoring weights
 DEFAULT_WEIGHTS = {
-    # OSINT signals (50% total)
-    "vt_detections": 0.25,  # VirusTotal detection ratio
-    "greynoise_malicious": 0.15,  # GreyNoise classification
+    # OSINT signals (45% total)
+    "vt_detections": 0.22,  # VirusTotal detection ratio
+    "greynoise_malicious": 0.13,  # GreyNoise classification
     "abuseipdb_score": 0.10,  # AbuseIPDB confidence
     # Behavioral signals (35% total)
-    "beacon_score": 0.15,  # C2 beaconing likelihood
-    "connection_count": 0.10,  # Frequency of communication
-    "data_volume": 0.10,  # Amount of data transferred
-    # Context signals (15% total)
-    "ja3_malware_match": 0.08,  # Known malicious fingerprint
+    "beacon_score": 0.13,  # C2 beaconing likelihood
+    "connection_count": 0.08,  # Frequency of communication
+    "data_volume": 0.08,  # Amount of data transferred
+    "flow_asymmetry": 0.06,  # Data exfiltration indicator
+    # Context signals (20% total)
+    "ja3_malware_match": 0.06,  # Known malicious fingerprint
     "dga_match": 0.04,  # DGA domain
     "self_signed_cert": 0.03,  # Suspicious certificate
+    "nxdomain_ratio": 0.04,  # High NXDOMAIN failure rate
+    "port_anomaly": 0.03,  # Non-standard port usage
 }
 
 # Default priority thresholds (configurable per instance)
@@ -268,6 +271,36 @@ class IOCScorer:
             factors["self_signed_cert"] = {
                 "value": True,
                 "contribution": round(cert_contribution, 3),
+            }
+
+        # NXDOMAIN ratio
+        nxdomain = context_data.get("nxdomain_ratio", 0)
+        if nxdomain > 0.3:
+            nx_contribution = min(nxdomain, 1.0) * self.weights.get("nxdomain_ratio", 0)
+            score += nx_contribution
+            factors["nxdomain_ratio"] = {
+                "value": f"{nxdomain:.0%}",
+                "contribution": round(nx_contribution, 3),
+            }
+
+        # Flow asymmetry
+        asymmetry_score = context_data.get("flow_asymmetry", 0)
+        if asymmetry_score > 0:
+            asym_contribution = asymmetry_score * self.weights.get("flow_asymmetry", 0)
+            score += asym_contribution
+            factors["flow_asymmetry"] = {
+                "value": round(asymmetry_score, 2),
+                "contribution": round(asym_contribution, 3),
+            }
+
+        # Port anomaly
+        port_anomaly = context_data.get("port_anomaly", 0)
+        if port_anomaly > 0:
+            port_contribution = port_anomaly * self.weights.get("port_anomaly", 0)
+            score += port_contribution
+            factors["port_anomaly"] = {
+                "value": round(port_anomaly, 2),
+                "contribution": round(port_contribution, 3),
             }
 
         return score, factors

@@ -1,17 +1,21 @@
+import logging
 import os
-import time
+import shutil
 
 import streamlit as st
 
-import shutil
-from pathlib import Path
-
 from app import config as C
-from app.llm.client import fetch_models, test_connection
-from app.utils.config_manager import get_config_manager
-from app.utils import geo_data
-from app.pipeline.osint_cache import get_osint_cache
 from app.database.repository import CaseRepository
+from app.llm.client import fetch_models, test_connection
+from app.pipeline.osint_cache import get_osint_cache
+from app.utils import geo_data
+from app.utils.config_manager import get_config_manager
+
+logger = logging.getLogger(__name__)
+
+# Maximum upload size: 2 GB
+MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_UPLOAD_SIZE_LABEL = "2 GB"
 
 # Keys to persist (mapping session_state key -> config file key)
 PERSIST_KEYS = {
@@ -194,7 +198,7 @@ def render_config_tab():
     current_lang = st.session_state.get("cfg_lm_language", "US English")
     languages = [
         "US English",
-        "Tradition Chinese (zh-tw)",
+        "Traditional Chinese (zh-tw)",
         "Simplified Chinese (zh-cn)",
         "Japanese",
         "Korean",
@@ -267,6 +271,7 @@ def render_config_tab():
 
     st.markdown("---")
     st.markdown("#### Extraction / Analysis")
+    st.caption(f"Maximum PCAP upload size: **{MAX_UPLOAD_SIZE_LABEL}**")
     st.session_state["cfg_limit_packets"] = st.number_input(
         "PyShark packet limit (0 = no limit)",
         min_value=0,
@@ -317,21 +322,21 @@ def render_config_tab():
     continents = geo_data.get_continents()
     curr_cont = st.session_state.get("cfg_home_continent", "")
     cont_idx = continents.index(curr_cont) if curr_cont in continents else 0
-    
+
     sel_cont = st.selectbox("Continent", continents, index=cont_idx)
     st.session_state["cfg_home_continent"] = sel_cont
 
     countries = geo_data.get_countries(sel_cont)
     curr_coun = st.session_state.get("cfg_home_country", "")
     coun_idx = countries.index(curr_coun) if curr_coun in countries else 0
-    
+
     sel_coun = st.selectbox("Country", countries, index=coun_idx)
     st.session_state["cfg_home_country"] = sel_coun
 
     cities = geo_data.get_cities(sel_coun)
     curr_city = st.session_state.get("cfg_home_city", "")
     city_idx = cities.index(curr_city) if curr_city in cities else 0
-    
+
     sel_city = st.selectbox("City", cities, index=city_idx)
     st.session_state["cfg_home_city"] = sel_city
 
@@ -386,46 +391,78 @@ def render_config_tab():
     st.markdown("#### Database & Data Management")
     st.caption("Granular controls to clear specific types of stored data. Use with caution.")
 
+    @st.dialog("Confirm Clear PCAP Data")
+    def _confirm_clear_pcap():
+        st.warning("This will permanently delete all PCAP data. This cannot be undone.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Cancel", use_container_width=True, key="cancel_clear_pcap"):
+                st.rerun()
+        with col2:
+            if st.button("Confirm Delete", type="primary", use_container_width=True, key="confirm_clear_pcap"):
+                try:
+                    for item in C.DATA_DIR.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        elif item.is_file() and item.suffix != ".db":
+                            item.unlink()
+                    C.CARVE_DIR.mkdir(parents=True, exist_ok=True)
+                    C.ZEEK_DIR.mkdir(parents=True, exist_ok=True)
+                    st.toast("PCAP data cleared")
+                    st.rerun()
+                except Exception as e:
+                    logger.error("Error clearing PCAP data: %s", e)
+                    st.error("Failed to clear PCAP data. Check logs for details.")
+
+    @st.dialog("Confirm Clear OSINT Cache")
+    def _confirm_clear_osint():
+        st.warning("This will permanently delete the OSINT cache. This cannot be undone.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Cancel", use_container_width=True, key="cancel_clear_osint"):
+                st.rerun()
+        with col2:
+            if st.button("Confirm Delete", type="primary", use_container_width=True, key="confirm_clear_osint"):
+                try:
+                    count = get_osint_cache().invalidate()
+                    st.toast(f"OSINT cache cleared ({count} entries)")
+                    st.rerun()
+                except Exception as e:
+                    logger.error("Error clearing OSINT cache: %s", e)
+                    st.error("Failed to clear OSINT cache. Check logs for details.")
+
+    @st.dialog("Confirm Clear Cases")
+    def _confirm_clear_cases():
+        st.warning("This will permanently delete all cases, analyses, and notes. This cannot be undone.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Cancel", use_container_width=True, key="cancel_clear_cases"):
+                st.rerun()
+        with col2:
+            if st.button("Confirm Delete", type="primary", use_container_width=True, key="confirm_clear_cases"):
+                try:
+                    if CaseRepository().clear_all():
+                        st.toast("Cases and analyses cleared")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear cases.")
+                except Exception as e:
+                    logger.error("Error clearing cases: %s", e)
+                    st.error("Failed to clear cases. Check logs for details.")
+
     dcol1, dcol2, dcol3 = st.columns(3)
     with dcol1:
-        if st.button("Clear PCAP Data", type="secondary", help="Delete all uploaded PCAPs and extracted files (Zeek, carved files)"):
-            try:
-                # Keep the data dir, but wipe subdirs and files that aren't DBs
-                for item in C.DATA_DIR.iterdir():
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    elif item.is_file() and item.suffix != ".db":
-                        item.unlink()
-                # Recreate essential subdirs
-                C.CARVE_DIR.mkdir(parents=True, exist_ok=True)
-                C.ZEEK_DIR.mkdir(parents=True, exist_ok=True)
-                st.success("PCAP data cleared.")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error clearing PCAP data: {e}")
+        clear_help = "Delete all uploaded PCAPs and extracted files (Zeek, carved files)"
+        if st.button("🗑️ Clear PCAP Data", type="secondary", help=clear_help):
+            _confirm_clear_pcap()
 
     with dcol2:
-        if st.button("Clear OSINT Cache", type="secondary", help="Clear the OSINT cache in SQLite"):
-            try:
-                count = get_osint_cache().invalidate()
-                st.success(f"OSINT Cache cleared ({count} entries).")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error clearing OSINT cache: {e}")
+        if st.button("🗑️ Clear OSINT Cache", type="secondary", help="Clear the OSINT cache in SQLite"):
+            _confirm_clear_osint()
 
     with dcol3:
-        if st.button("Clear Cases", type="secondary", help="Clear all cases, analyses, and notes from database"):
-            try:
-                if CaseRepository().clear_all():
-                    st.success("Cases and analyses cleared.")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("Failed to clear cases.")
-            except Exception as e:
-                st.error(f"Error clearing cases: {e}")
+        if st.button("🗑️ Clear Cases", type="secondary", help="Clear all cases, analyses, and notes from database"):
+            _confirm_clear_cases()
 
     st.markdown("---")
     with st.expander("Runtime Logs"):

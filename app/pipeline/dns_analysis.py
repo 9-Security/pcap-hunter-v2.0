@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 MAX_DOMAIN_LENGTH = 253  # RFC 1035
 MAX_LABEL_LENGTH = 63  # RFC 1035
 VALID_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9\-_.]*[a-z0-9])?$", re.IGNORECASE)
+IP_LIKE_PATTERN = re.compile(r"^[\d.]+$")
 
 
 def validate_domain(domain: str) -> bool:
@@ -67,13 +68,13 @@ ENTROPY_WHITELIST_TLDS = {
     "cloudflare.com",
 }
 
-# Common benign long domain patterns
+# Common benign long domain patterns (pre-compiled for performance)
 BENIGN_PATTERNS = [
-    r"^_dmarc\.",
-    r"^_domainkey\.",
-    r"^_acme-challenge\.",
-    r"^autodiscover\.",
-    r"^selector[12]\.",
+    re.compile(r"^_dmarc\."),
+    re.compile(r"^_domainkey\."),
+    re.compile(r"^_acme-challenge\."),
+    re.compile(r"^autodiscover\."),
+    re.compile(r"^selector[12]\."),
 ]
 
 # --- Detection Thresholds ---
@@ -85,6 +86,8 @@ TUNNELING_MIN_SUBDOMAINS = 5
 FAST_FLUX_SCORE_THRESHOLD = 0.2
 FAST_FLUX_CONFIRMED_THRESHOLD = 0.5
 FAST_FLUX_TOP_DOMAINS = 50
+NXDOMAIN_RATIO_THRESHOLD = 0.3
+QUERY_VELOCITY_THRESHOLD = 50  # queries per second
 
 # --- Result Limits ---
 MAX_DGA_RESULTS = 50
@@ -210,7 +213,7 @@ def is_whitelisted_domain(domain: str) -> bool:
         if domain_lower.endswith(f".{tld}") or domain_lower == tld:
             return True
     for pattern in BENIGN_PATTERNS:
-        if re.match(pattern, domain_lower):
+        if pattern.match(domain_lower):
             return True
     return False
 
@@ -297,7 +300,12 @@ def detect_dga(domain: str) -> DGAResult:
     )
 
 
-def detect_tunneling(dns_records: list[DNSRecord], domain: str) -> TunnelingResult:
+def detect_tunneling(
+    dns_records: list[DNSRecord],
+    domain: str,
+    *,
+    pre_filtered: list[DNSRecord] | None = None,
+) -> TunnelingResult:
     """
     Detect DNS tunneling indicators for a domain.
 
@@ -308,15 +316,24 @@ def detect_tunneling(dns_records: list[DNSRecord], domain: str) -> TunnelingResu
     - Regular query patterns
 
     Args:
-        dns_records: List of DNS records to analyze
+        dns_records: List of DNS records to analyze (used as fallback)
         domain: Base domain to analyze
+        pre_filtered: Pre-filtered records for this domain's base domain.
+            If provided, skips the O(N) scan of dns_records.
 
     Returns:
         TunnelingResult with detection details
     """
-    # Filter records for this domain
     domain_lower = domain.lower()
-    relevant = [r for r in dns_records if r.query.lower().endswith(domain_lower) or r.query.lower() == domain_lower]
+    if pre_filtered is not None:
+        # Use pre-filtered records (already scoped to base domain)
+        relevant = [
+            r for r in pre_filtered
+            if r.query.lower().endswith(domain_lower) or r.query.lower() == domain_lower
+        ]
+    else:
+        # Fallback: scan all records (backward compatible)
+        relevant = [r for r in dns_records if r.query.lower().endswith(domain_lower) or r.query.lower() == domain_lower]
 
     if not relevant:
         return TunnelingResult(
@@ -401,7 +418,12 @@ def detect_tunneling(dns_records: list[DNSRecord], domain: str) -> TunnelingResu
     )
 
 
-def detect_fast_flux(dns_records: list[DNSRecord], domain: str) -> FastFluxResult:
+def detect_fast_flux(
+    dns_records: list[DNSRecord],
+    domain: str,
+    *,
+    pre_filtered: list[DNSRecord] | None = None,
+) -> FastFluxResult:
     """
     Detect fast flux DNS behavior.
 
@@ -411,14 +433,19 @@ def detect_fast_flux(dns_records: list[DNSRecord], domain: str) -> FastFluxResul
     - Frequent IP changes in short time
 
     Args:
-        dns_records: List of DNS records to analyze
+        dns_records: List of DNS records to analyze (used as fallback)
         domain: Domain to analyze
+        pre_filtered: Pre-filtered records for this domain's base domain.
+            If provided, skips the O(N) scan of dns_records.
 
     Returns:
         FastFluxResult with detection details
     """
     domain_lower = domain.lower()
-    relevant = [r for r in dns_records if r.query.lower() == domain_lower and r.answers]
+    if pre_filtered is not None:
+        relevant = [r for r in pre_filtered if r.query.lower() == domain_lower and r.answers]
+    else:
+        relevant = [r for r in dns_records if r.query.lower() == domain_lower and r.answers]
 
     if not relevant:
         return FastFluxResult(
@@ -442,7 +469,7 @@ def detect_fast_flux(dns_records: list[DNSRecord], domain: str) -> FastFluxResul
         timestamps.append(r.ts)
         for answer in r.answers:
             # Filter for IP-like answers (A/AAAA records)
-            if re.match(r"^[\d.]+$", answer) or ":" in answer:
+            if IP_LIKE_PATTERN.match(answer) or ":" in answer:
                 all_ips.append(answer)
         all_ttls.extend(r.ttls)
 
@@ -504,6 +531,111 @@ def detect_fast_flux(dns_records: list[DNSRecord], domain: str) -> FastFluxResul
     )
 
 
+def analyze_nxdomain(records: list[DNSRecord]) -> dict[str, Any]:
+    """
+    Analyze NXDOMAIN response ratios per source IP.
+
+    High NXDOMAIN ratios indicate DGA activity or domain enumeration.
+
+    Args:
+        records: List of DNS records
+
+    Returns:
+        Dict with nxdomain_count, nxdomain_ratio, and per-source breakdown
+    """
+    nxdomain_codes = {"NXDOMAIN", "3", "NXDomain"}
+    total = len(records)
+    if total == 0:
+        return {"nxdomain_count": 0, "nxdomain_ratio": 0.0, "sources": []}
+
+    nxdomain_count = sum(1 for r in records if r.rcode in nxdomain_codes)
+    nxdomain_ratio = nxdomain_count / total
+
+    # Per-source breakdown
+    src_total: dict[str, int] = defaultdict(int)
+    src_nxdomain: dict[str, int] = defaultdict(int)
+    for r in records:
+        src_total[r.src] += 1
+        if r.rcode in nxdomain_codes:
+            src_nxdomain[r.src] += 1
+
+    sources = []
+    for src, nx_count in sorted(src_nxdomain.items(), key=lambda x: -x[1]):
+        total_q = src_total[src]
+        ratio = nx_count / total_q if total_q > 0 else 0
+        if ratio > 0.1:  # Only include sources with >10% NXDOMAIN
+            sources.append({
+                "src": src,
+                "nxdomain_count": nx_count,
+                "total_queries": total_q,
+                "ratio": round(ratio, 3),
+                "is_suspicious": ratio > NXDOMAIN_RATIO_THRESHOLD,
+            })
+
+    return {
+        "nxdomain_count": nxdomain_count,
+        "nxdomain_ratio": round(nxdomain_ratio, 3),
+        "is_suspicious": nxdomain_ratio > NXDOMAIN_RATIO_THRESHOLD,
+        "sources": sources[:20],
+    }
+
+
+def analyze_query_velocity(records: list[DNSRecord]) -> list[dict[str, Any]]:
+    """
+    Detect high DNS query rates per source IP.
+
+    Sustained high query rates may indicate DNS tunneling or enumeration.
+
+    Args:
+        records: List of DNS records
+
+    Returns:
+        List of sources with high query velocity
+    """
+    if not records:
+        return []
+
+    # Group by source IP
+    src_records: dict[str, list[float]] = defaultdict(list)
+    for r in records:
+        src_records[r.src].append(r.ts)
+
+    results = []
+    for src, timestamps in src_records.items():
+        if len(timestamps) < 10:
+            continue
+
+        timestamps.sort()
+        duration = timestamps[-1] - timestamps[0]
+        if duration <= 0:
+            continue
+
+        qps = len(timestamps) / duration
+
+        # Score based on query velocity
+        score = 0.0
+        if qps > QUERY_VELOCITY_THRESHOLD * 2:
+            score = 0.8
+        elif qps > QUERY_VELOCITY_THRESHOLD:
+            score = 0.5
+        elif qps > QUERY_VELOCITY_THRESHOLD / 2:
+            score = 0.3
+        else:
+            continue
+
+        results.append({
+            "src": src,
+            "queries": len(timestamps),
+            "duration_sec": round(duration, 1),
+            "qps": round(qps, 1),
+            "score": score,
+            "is_suspicious": qps > QUERY_VELOCITY_THRESHOLD,
+        })
+
+    results.sort(key=lambda x: x["qps"], reverse=True)
+    return results[:20]
+
+
 def parse_dns_log(df: pd.DataFrame) -> list[DNSRecord]:
     """
     Parse Zeek dns.log DataFrame into DNSRecord objects.
@@ -516,7 +648,7 @@ def parse_dns_log(df: pd.DataFrame) -> list[DNSRecord]:
     """
     records = []
 
-    for _, row in df.iterrows():
+    for row in df.to_dict(orient="records"):
         try:
             # Handle different column naming conventions
             ts = float(row.get("ts", 0))
@@ -557,7 +689,7 @@ def parse_dns_log(df: pd.DataFrame) -> list[DNSRecord]:
                     )
                 )
         except (ValueError, TypeError) as e:
-            logger.debug(f"Failed to parse DNS record: {e}")
+            logger.debug("Failed to parse DNS record: %s", e)
             continue
 
     return records
@@ -632,10 +764,19 @@ def analyze_dns(
     if phase:
         phase.set(70, "Analyzing tunneling patterns...")
 
+    # Pre-index DNS records by base domain to avoid O(N*M) scans
+    domain_records_index: dict[str, list[DNSRecord]] = defaultdict(list)
+    for r in records:
+        parts = r.query.lower().rsplit(".", 2)
+        if len(parts) >= 2:
+            base = ".".join(parts[-2:])
+            domain_records_index[base].append(r)
+
     # Tunneling detection (per base domain)
     for base_domain, subdomains in domain_groups.items():
         if len(subdomains) > TUNNELING_MIN_SUBDOMAINS:
-            tunnel = detect_tunneling(records, base_domain)
+            pre_filtered = domain_records_index.get(base_domain.lower(), [])
+            tunnel = detect_tunneling(records, base_domain, pre_filtered=pre_filtered)
             if tunnel.score > TUNNELING_SCORE_THRESHOLD:
                 tunneling_results.append(tunnel)
 
@@ -647,7 +788,10 @@ def analyze_dns(
     top_domains = [d for d, _ in domain_counts.most_common(FAST_FLUX_TOP_DOMAINS)]
 
     for domain in top_domains:
-        ff = detect_fast_flux(records, domain)
+        parts = domain.lower().rsplit(".", 2)
+        base_key = ".".join(parts[-2:]) if len(parts) >= 2 else domain.lower()
+        pre_filtered = domain_records_index.get(base_key, [])
+        ff = detect_fast_flux(records, domain, pre_filtered=pre_filtered)
         if ff.score > FAST_FLUX_SCORE_THRESHOLD:
             fast_flux_results.append(ff)
 
@@ -664,6 +808,12 @@ def analyze_dns(
     # Unique DNS servers
     dns_servers = list({r.dst for r in records})
 
+    # NXDOMAIN analysis
+    nxdomain_analysis = analyze_nxdomain(records)
+
+    # Query velocity analysis
+    query_velocity = analyze_query_velocity(records)
+
     # Build result
     result = {
         "total_records": len(records),
@@ -673,6 +823,8 @@ def analyze_dns(
         "query_types": dict(query_types),
         "response_codes": dict(response_codes),
         "top_queried": [{"domain": d, "count": c} for d, c in top_queried],
+        "nxdomain_analysis": nxdomain_analysis,
+        "query_velocity": query_velocity,
         "dga_detections": [
             {
                 "domain": r.domain,
@@ -722,6 +874,11 @@ def analyze_dns(
             "dga_count": sum(1 for r in dga_results if r.is_dga),
             "tunneling_count": sum(1 for r in tunneling_results if r.is_tunneling),
             "fast_flux_count": sum(1 for r in fast_flux_results if r.is_fast_flux),
+            "nxdomain_suspicious": nxdomain_analysis.get("is_suspicious", False),
+            "nxdomain_ratio": nxdomain_analysis.get("nxdomain_ratio", 0),
+            "high_velocity_sources": sum(
+                1 for v in query_velocity if v.get("is_suspicious")
+            ),
         },
     }
 
@@ -734,6 +891,14 @@ def analyze_dns(
             alert_msg.append(f"{alerts['tunneling_count']} tunneling")
         if alerts["fast_flux_count"]:
             alert_msg.append(f"{alerts['fast_flux_count']} fast-flux")
+        if alerts.get("nxdomain_suspicious"):
+            alert_msg.append(
+                f"NXDOMAIN {alerts['nxdomain_ratio']:.0%}"
+            )
+        if alerts.get("high_velocity_sources"):
+            alert_msg.append(
+                f"{alerts['high_velocity_sources']} high-velocity"
+            )
 
         summary = f"Analyzed {len(records)} DNS records, {len(all_domains)} domains."
         if alert_msg:

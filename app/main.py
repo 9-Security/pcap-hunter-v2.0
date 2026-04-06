@@ -6,42 +6,94 @@ import sys
 # Ensure top-level repo path importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+import concurrent.futures
+import logging
 import os
 import time
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 from app import config as C
 from app.llm.client import generate_report
+from app.pipeline.batch import BatchProcessor, PCAPResult
 from app.pipeline.beacon import rank_beaconing
-from app.pipeline.carve import carve_http_payloads
+from app.pipeline.carve import CarveError, carve_http_payloads
 from app.pipeline.geoip import GeoIP
 from app.pipeline.osint import enrich as osint_enrich
 from app.pipeline.pcap_count import count_packets_fast
 from app.pipeline.pyshark_pass import parse_pcap_pyshark
-from app.pipeline.state import PhaseTracker, end_run, is_run_active, reset_run_state
+from app.pipeline.state import (
+    BatchPhaseTracker,
+    PhaseTracker,
+    end_run,
+    is_run_active,
+    reset_run_state,
+)
 from app.pipeline.zeek import load_zeek_any, run_zeek
-from app.ui.charts import plot_flow_timeline, plot_protocol_distribution, plot_top_n_charts, plot_world_map
+from app.ui.charts import (
+    plot_attack_timeline,
+    plot_flow_timeline,
+    plot_network_graph,
+    plot_protocol_distribution,
+    plot_top_n_charts,
+    plot_world_map,
+)
 from app.ui.config_ui import init_config_defaults, render_config_tab
 from app.ui.layout import (
     inject_css,
     make_progress_panel,
     make_results_panel,
     make_tabs,
+    render_active_filters,
+    render_batch_summary,
     render_carved,
+    render_chart_hint,
+    render_correlation_results,
+    render_cross_file_correlation,
     render_dns_analysis,
+    render_flow_asymmetry,
     render_flows,
+    render_hunting_checklist,
+    render_ioc_search,
     render_ja3,
+    render_nxdomain_analysis,
     render_osint,
     render_overview,
+    render_per_file_summary,
+    render_port_anomalies,
+    render_query_velocity,
     render_report,
+    render_threat_summary,
     render_tls_certificates,
     render_yara_results,
     render_zeek,
 )
 from app.utils.common import ensure_dir, is_public_ipv4, make_slug, uniq_sorted
+
+logger = logging.getLogger(__name__)
+
+
+def validate_pcap_path(path_str: str) -> str | None:
+    """Validate that a user-provided PCAP path is within allowed directories.
+
+    Returns the resolved path string if valid, None otherwise.
+    """
+    try:
+        p = pathlib.Path(path_str).resolve()
+    except (OSError, ValueError):
+        return None
+    if not p.is_file():
+        return None
+    if p.suffix.lower() not in (".pcap", ".pcapng"):
+        return None
+    for allowed in C.ALLOWED_PCAP_DIRS:
+        try:
+            p.relative_to(allowed)
+            return str(p)
+        except ValueError:
+            continue
+    return None
 
 
 def get_df_state(key: str) -> pd.DataFrame:
@@ -56,6 +108,250 @@ def _ss_default(key: str, value):
 
 def cfg_get(name: str, env_key: str, default):
     return st.session_state.get(name) or os.getenv(env_key, default)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline worker functions (thread-safe — no Streamlit calls)
+# ---------------------------------------------------------------------------
+
+
+def _pyshark_worker(pcap_path: str, limit_packets: int | None, total_packets: int | None) -> dict:
+    """Run PyShark/tshark parsing in a worker thread (no UI updates)."""
+    return parse_pcap_pyshark(
+        pcap_path,
+        limit_packets=limit_packets,
+        phase=None,
+        total_packets=total_packets,
+        progress_every=500,
+    )
+
+
+def _zeek_worker(pcap_path: str, zeek_dir: str) -> dict:
+    """Run Zeek in a worker thread (no UI updates)."""
+    return run_zeek(pcap_path, zeek_dir, phase=None)
+
+
+def _carve_worker(pcap_path: str, carve_dir: str) -> list:
+    """Run HTTP carving in a worker thread (no UI updates)."""
+    try:
+        return carve_http_payloads(pcap_path, carve_dir, phase=None)
+    except CarveError as e:
+        logger.warning("HTTP carving failed: %s", e)
+        return []
+
+
+def _run_single_pcap_pipeline(
+    pcap_path: str,
+    tracker: PhaseTracker,
+    phases: list[tuple[str, bool]],
+    limit_packets: int | None,
+    osint_keys: dict,
+    osint_top_n: int,
+    do_pyshark: bool,
+    do_zeek: bool,
+    do_carve: bool,
+    pre_count: bool,
+    do_yara: bool,
+) -> PCAPResult:
+    """Run stages 1-9 for a single PCAP file and return a PCAPResult.
+
+    Stages 2 (PyShark) and 3 (Zeek) run in parallel when
+    ``C.PARALLEL_PARSE_ENABLED`` is True.  Stage 7 (Carving) runs in
+    parallel with stages 4-6 (DNS/TLS/Beaconing).
+    """
+    filename = pathlib.Path(pcap_path).name
+    phase_dict = dict(phases)
+
+    features: dict = {
+        "flows": [],
+        "artifacts": {"ips": [], "domains": [], "urls": [], "hashes": [], "ja3": []},
+    }
+    zeek_tables: dict = {}
+    beacon_df = pd.DataFrame()
+    carved: list = []
+    osint_data: dict = {"ips": {}, "domains": {}, "ja3": {}}
+    dns_result: dict | None = None
+    tls_result: dict | None = None
+    total_pkts: int | None = None
+
+    try:
+        # --- Stage 1: Packet counting ---
+        if phase_dict.get("Packet counting (tshark)", False):
+            p = tracker.next_phase("Packet counting (tshark)")
+            p.set(5, "Counting packets\u2026")
+            total_pkts = count_packets_fast(pcap_path)
+            p.done(f"Found ~{total_pkts:,} packets." if total_pkts else "Count unavailable.")
+
+        # --- Stages 2 & 3: PyShark + Zeek (parallel) ---
+        pyshark_needed = phase_dict.get("Parsing Packets", False)
+        zeek_needed = phase_dict.get("Zeek processing", False)
+
+        if C.PARALLEL_PARSE_ENABLED and pyshark_needed and zeek_needed:
+            p_pyshark = tracker.next_phase("Parsing Packets")
+            p_zeek = tracker.next_phase("Zeek processing")
+            p_pyshark.set(5, "Parsing packets (parallel)\u2026")
+            p_zeek.set(5, "Running Zeek (parallel)\u2026")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                fut_pyshark = executor.submit(_pyshark_worker, pcap_path, limit_packets, total_pkts)
+                fut_zeek = executor.submit(_zeek_worker, pcap_path, str(C.ZEEK_DIR))
+
+                for future in concurrent.futures.as_completed([fut_pyshark, fut_zeek]):
+                    try:
+                        if future is fut_pyshark:
+                            features = future.result()
+                            p_pyshark.done("Packet parsing complete.")
+                        else:
+                            logs = future.result()
+                            if logs:
+                                for name, path in logs.items():
+                                    try:
+                                        df = load_zeek_any(path)
+                                    except Exception:
+                                        df = pd.DataFrame()
+                                    zeek_tables[name] = df.head(2000)
+                            p_zeek.done("Zeek logs loaded.")
+                    except Exception as exc:
+                        if future is fut_pyshark:
+                            logger.error("PyShark failed: %s", exc)
+                            p_pyshark.done("Parsing failed.")
+                        else:
+                            logger.error("Zeek failed: %s", exc)
+                            p_zeek.done("Zeek failed.")
+        else:
+            # Sequential fallback
+            if pyshark_needed:
+                p = tracker.next_phase("Parsing Packets")
+                features = parse_pcap_pyshark(
+                    pcap_path, limit_packets=limit_packets, phase=p,
+                    total_packets=total_pkts, progress_every=250,
+                )
+                p.done("Packet parsing complete.")
+
+            if zeek_needed:
+                p = tracker.next_phase("Zeek processing")
+                try:
+                    logs = run_zeek(pcap_path, str(C.ZEEK_DIR), phase=p)
+                except Exception as e:
+                    logs = {}
+                    logger.error("Zeek failed: %s", e)
+                if logs:
+                    for name, path in logs.items():
+                        try:
+                            df = load_zeek_any(path)
+                        except Exception:
+                            df = pd.DataFrame()
+                        zeek_tables[name] = df.head(2000)
+                p.done("Zeek logs loaded.")
+
+        # Merge Zeek DNS queries into artifacts
+        from app.pipeline.zeek import merge_zeek_dns
+
+        features = merge_zeek_dns(zeek_tables, features)
+
+        # --- Stages 4-6 + 7 (parallel carving) ---
+        carve_future = None
+        if C.PARALLEL_PARSE_ENABLED and phase_dict.get("HTTP carving (tshark)", False) and do_carve:
+            carve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            carve_future = carve_executor.submit(_carve_worker, pcap_path, str(C.CARVE_DIR))
+
+        # Stage 4: DNS Analysis
+        if phase_dict.get("DNS Analysis", False):
+            p = tracker.next_phase("DNS Analysis")
+            from app.pipeline.dns_analysis import analyze_dns
+
+            dns_result = analyze_dns(zeek_tables, features, phase=p)
+
+        # Stage 5: TLS Certificate Analysis
+        if phase_dict.get("TLS Certificate Analysis", False):
+            p = tracker.next_phase("TLS Certificate Analysis")
+            from app.pipeline.tls_certs import analyze_certificates
+
+            tls_result = analyze_certificates(pcap_path=pcap_path, zeek_tables=zeek_tables, phase=p)
+
+        # Stage 6: Beaconing
+        p = tracker.next_phase("Beaconing ranking")
+        if features.get("flows"):
+            p.set(30, "Scoring flows\u2026")
+            beacon_df = rank_beaconing(features["flows"], top_n=20)
+            if not isinstance(beacon_df, pd.DataFrame):
+                beacon_df = pd.DataFrame()
+            p.set(90, "Sorting top candidates\u2026")
+        p.done("Beaconing step complete.")
+
+        # Stage 7: Collect carving result (or run sequentially)
+        if carve_future is not None:
+            p_carve = tracker.next_phase("HTTP carving (tshark)")
+            p_carve.set(50, "Waiting for HTTP carving\u2026")
+            try:
+                carved = carve_future.result()
+            except Exception as e:
+                logger.error("HTTP carving failed: %s", e)
+                carved = []
+            carve_executor.shutdown(wait=False)
+            p_carve.done("HTTP carving complete.")
+        elif phase_dict.get("HTTP carving (tshark)", False) and do_carve:
+            p = tracker.next_phase("HTTP carving (tshark)")
+            try:
+                carved = carve_http_payloads(pcap_path, str(C.CARVE_DIR), phase=p)
+            except CarveError as e:
+                logger.error("HTTP carving failed: %s", e)
+                carved = []
+            p.done("HTTP carving complete.")
+
+        # Extract hashes from carved payloads
+        for item in carved:
+            h = item.get("sha256")
+            if h:
+                features["artifacts"]["hashes"].append(h)
+        features["artifacts"]["hashes"] = uniq_sorted(features["artifacts"]["hashes"])
+
+        # Stage 8: YARA Scanning
+        if phase_dict.get("YARA Scanning", False) and do_yara:
+            p = tracker.next_phase("YARA Scanning")
+            from app.pipeline.yara_scan import scan_carved_files
+
+            _yara = scan_carved_files(carved, phase=p)
+            st.session_state["yara_results"] = _yara
+
+        # Stage 9: OSINT enrichment
+        p = tracker.next_phase("OSINT enrichment")
+        feats = features if isinstance(features, dict) else {
+            "flows": [], "artifacts": {"ips": [], "domains": [], "urls": [], "hashes": [], "ja3": []},
+        }
+        arts = dict(feats.get("artifacts", {}))
+        arts["ips"] = [ip for ip in arts.get("ips", []) if is_public_ipv4(ip)]
+        if osint_top_n > 0:
+            arts["ips"] = pick_top_public_ips(feats, osint_top_n)
+        osint_data = osint_enrich(arts, osint_keys, phase=p)
+        osint_data = osint_data if isinstance(osint_data, dict) else {"ips": {}, "domains": {}, "ja3": {}}
+        p.done("OSINT complete.")
+
+        # Bulk rDNS for all public IPs (cached, fast)
+        from app.utils.network_utils import bulk_resolve_ips
+
+        all_public = [ip for ip in features.get("artifacts", {}).get("ips", []) if is_public_ipv4(ip)]
+        rdns_map = bulk_resolve_ips(all_public, max_workers=C.RDNS_MAX_WORKERS)
+        # Backfill PTR into OSINT data for IPs not already resolved
+        for ip, hostname in rdns_map.items():
+            if ip in osint_data.get("ips", {}) and "ptr" not in osint_data["ips"][ip]:
+                osint_data["ips"][ip]["ptr"] = hostname
+
+    except Exception as e:
+        logger.error("Pipeline failed for %s: %s", filename, e)
+        return PCAPResult(path=pcap_path, filename=filename, error=str(e))
+
+    return PCAPResult(
+        path=pcap_path,
+        filename=filename,
+        features=features,
+        zeek_tables=zeek_tables,
+        osint=osint_data,
+        beacon_df=beacon_df if isinstance(beacon_df, pd.DataFrame) else None,
+        dns_analysis=dns_result or {},
+        tls_analysis=tls_result or {},
+        packet_count=total_pkts or 0,
+    )
 
 
 def pick_top_public_ips(features: dict, n: int) -> list[str]:
@@ -125,6 +421,12 @@ for k, v in [
     ("dns_analysis", None),
     ("tls_analysis", None),
     ("yara_results", None),
+    ("correlations", None),
+    ("flow_asymmetry", None),
+    ("port_anomalies", None),
+    ("__pcap_paths", []),
+    ("__batch_mode", False),
+    ("__batch_result", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -134,7 +436,11 @@ with tab_upload:
     st.subheader("1) Load PCAP")
     col_a, col_b = st.columns([1, 1])
     with col_a:
-        uploaded = st.file_uploader("Upload a .pcap / .pcapng", type=["pcap", "pcapng"])
+        uploaded_files = st.file_uploader(
+            "Upload .pcap / .pcapng files",
+            type=["pcap", "pcapng"],
+            accept_multiple_files=True,
+        )
     with col_b:
         pcap_path_text = st.text_input("...or type a container path (e.g., /data/capture.pcap)", value="")
 
@@ -143,21 +449,58 @@ with tab_upload:
     ensure_dir(C.CARVE_DIR)
 
     pcap_path = None
-    if uploaded is not None:
-        pcap_path = str((C.DATA_DIR / f"upload_{int(time.time())}.pcap").resolve())
-        pathlib.Path(pcap_path).write_bytes(uploaded.read())
+    pcap_paths: list[str] = []
+    if uploaded_files:
+        ts = int(time.time())
+        for i, uploaded in enumerate(uploaded_files):
+            save_path = str((C.DATA_DIR / f"upload_{ts}_{i}.pcap").resolve())
+            pathlib.Path(save_path).write_bytes(uploaded.read())
+            pcap_paths.append(save_path)
+        pcap_path = pcap_paths[0]
         st.session_state["__pcap_path"] = pcap_path
-        source_msg = f"Uploaded: {uploaded.name}"
+        st.session_state["__pcap_paths"] = pcap_paths
+        st.session_state["__batch_mode"] = len(pcap_paths) > 1
+        if len(pcap_paths) > 1:
+            names = ", ".join(u.name for u in uploaded_files)
+            source_msg = f"Uploaded {len(pcap_paths)} files: {names}"
+        else:
+            source_msg = f"Uploaded: {uploaded_files[0].name}"
     elif pcap_path_text.strip():
-        pcap_path = pcap_path_text.strip()
-        st.session_state["__pcap_path"] = pcap_path
-        source_msg = f"Manual Path: {pcap_path}"
+        validated = validate_pcap_path(pcap_path_text.strip())
+        if validated:
+            pcap_path = validated
+            pcap_paths = [validated]
+            st.session_state["__pcap_path"] = pcap_path
+            st.session_state["__pcap_paths"] = pcap_paths
+            st.session_state["__batch_mode"] = False
+            source_msg = f"Manual Path: {pcap_path}"
+        else:
+            st.error("Path must point to a .pcap/.pcapng file inside an allowed directory (data/, pcaps/, or /data/).")
+            pcap_path = None
+    elif st.session_state.get("__pcap_paths"):
+        pcap_paths = st.session_state["__pcap_paths"]
+        pcap_path = pcap_paths[0] if pcap_paths else None
+        if len(pcap_paths) > 1:
+            source_msg = f"Last Source: {len(pcap_paths)} files"
+        elif pcap_path:
+            source_msg = f"Last Source: {pathlib.Path(pcap_path).name}"
     elif st.session_state.get("__pcap_path"):
         pcap_path = st.session_state["__pcap_path"]
+        pcap_paths = [pcap_path]
         source_msg = f"Last Source: {pathlib.Path(pcap_path).name}"
 
     if pcap_path:
         st.info(f"**Active Source:** {source_msg}")
+        if st.session_state.get("__batch_mode"):
+            # Validate batch
+            processor = BatchProcessor(pcap_paths)
+            if processor.skipped_files:
+                for name, err in processor.skipped_files:
+                    st.warning(f"Skipped {name}: {err}")
+            st.caption(
+                f"Batch: {len(processor.pcap_paths)} valid file(s), "
+                f"{processor.total_size / (1024 * 1024):.1f} MB total"
+            )
 
     do_pyshark = bool(st.session_state.get("cfg_do_pyshark", True))
     do_zeek = bool(st.session_state.get("cfg_do_zeek", True))
@@ -194,9 +537,14 @@ with tab_upload:
                 "carved": [],
                 "__total_pkts": None,
                 "__pcap_path": pcap_path,
+                "__pcap_paths": pcap_paths or [pcap_path],
                 "dns_analysis": None,
                 "tls_analysis": None,
                 "yara_results": None,
+                "correlations": None,
+                "flow_asymmetry": None,
+                "port_anomalies": None,
+                "__batch_result": None,
             }
         )
         st.success("Analysis started. Switch to the **Progress** tab to monitor.")
@@ -207,19 +555,27 @@ with tab_progress:
     progress_panel = make_progress_panel(st.container())
     if is_run_active():
         pcap_path = st.session_state.get("__pcap_path")
+        pcap_paths = st.session_state.get("__pcap_paths") or ([pcap_path] if pcap_path else [])
+        batch_mode = st.session_state.get("__batch_mode", False) and len(pcap_paths) > 1
 
         base_url = cfg_get("cfg_lm_base_url", "LMSTUDIO_BASE_URL", C.LM_BASE_URL)
         api_key = cfg_get("cfg_lm_api_key", "LMSTUDIO_API_KEY", C.LM_API_KEY)
         model = cfg_get("cfg_lm_model", "LMSTUDIO_MODEL", C.LM_MODEL)
         language = cfg_get("cfg_lm_language", "LMSTUDIO_LANGUAGE", C.LM_LANGUAGE)
 
-        limit_packets = int(st.session_state.get("cfg_limit_packets", C.DEFAULT_PYSHARK_LIMIT)) or None
+        try:
+            limit_packets = int(st.session_state.get("cfg_limit_packets", C.DEFAULT_PYSHARK_LIMIT)) or None
+        except (ValueError, TypeError):
+            limit_packets = C.DEFAULT_PYSHARK_LIMIT
         do_pyshark = bool(st.session_state.get("cfg_do_pyshark", True))
         do_zeek = bool(st.session_state.get("cfg_do_zeek", True))
         do_carve = bool(st.session_state.get("cfg_do_carve", True))
         pre_count = bool(st.session_state.get("cfg_pre_count", True))
         do_yara = bool(st.session_state.get("cfg_do_yara", True))
-        osint_top_n = int(st.session_state.get("cfg_osint_top_ips", C.OSINT_TOP_IPS_DEFAULT) or 0)
+        try:
+            osint_top_n = int(st.session_state.get("cfg_osint_top_ips", C.OSINT_TOP_IPS_DEFAULT) or 0)
+        except (ValueError, TypeError):
+            osint_top_n = C.OSINT_TOP_IPS_DEFAULT
 
         osint_keys = {
             "OTX_KEY": st.session_state.get("cfg_otx", ""),
@@ -234,98 +590,180 @@ with tab_progress:
             ("Packet counting (tshark)", pre_count and do_pyshark),
             ("Parsing Packets", do_pyshark),
             ("Zeek processing", do_zeek),
-            ("DNS Analysis", do_zeek),  # Requires Zeek dns.log
-            ("TLS Certificate Analysis", do_zeek),  # Requires Zeek ssl.log
+            ("DNS Analysis", do_zeek),
+            ("TLS Certificate Analysis", do_zeek),
             ("Beaconing ranking", True),
             ("HTTP carving (tshark)", do_carve),
-            ("YARA Scanning", do_carve and do_yara),  # Requires carved files
+            ("YARA Scanning", do_carve and do_yara),
             ("OSINT enrichment", True),
             ("LLM report", True),
         ]
-        total_phases = sum(1 for _, enabled in phases if enabled)
-        tracker = PhaseTracker(total_phases, progress_container=progress_panel)
-        tracker.update_overall("Running…")
+        active_phases = [t for t, enabled in phases if enabled]
+        # LLM is handled separately after pipeline stages
+        pipeline_phases = [p for p in active_phases if p != "LLM report"]
 
-        # Safe loads
-        features = st.session_state.get("features") or {
-            "flows": [],
-            "artifacts": {"ips": [], "domains": [], "urls": [], "hashes": [], "ja3": []},
-        }
-        zeek_tables = st.session_state.get("zeek_tables") or {}
-        beacon_df = get_df_state("beacon_df")
-        carved = st.session_state.get("carved") or []
-        osint_data = st.session_state.get("osint") or {"ips": {}, "domains": {}, "ja3": {}}
-        report_md = st.session_state.get("report")
+        # ---- BATCH MODE ----
+        if batch_mode:
+            processor = BatchProcessor(pcap_paths)
+            batch_tracker = BatchPhaseTracker(
+                total_files=len(processor.pcap_paths),
+                phases_per_file=len(pipeline_phases),
+                container=progress_panel,
+            )
 
-        # Packet counting
-        if dict(phases).get("Packet counting (tshark)", False):
-            p = tracker.next_phase("Packet counting (tshark)")
-            if not st.session_state.get(f"done_{make_slug('Packet counting (tshark)')}", False):
-                if not st.session_state.get(f"skip_{make_slug('Packet counting (tshark)')}", False):
-                    p.set(5, "Counting packets…")
-                    st.session_state["__total_pkts"] = count_packets_fast(pcap_path)
-                    p.done(
-                        f"Found ~{st.session_state['__total_pkts']:,} packets."
-                        if st.session_state["__total_pkts"]
-                        else "Count unavailable."
-                    )
-                else:
-                    p.done("Counting skipped.")
+            for file_path in processor.pcap_paths:
+                file_tracker = batch_tracker.start_file(str(file_path))
+                file_tracker.update_overall("Running\u2026")
 
-        # PyShark
-        if dict(phases).get("Parsing Packets", False):
-            p = tracker.next_phase("Parsing Packets")
-            if not st.session_state.get(f"done_{make_slug('Parsing Packets')}", False):
-                if not st.session_state.get(f"skip_{make_slug('Parsing Packets')}", False):
-                    with st.spinner("Parsing packets…"):
-                        features = parse_pcap_pyshark(
-                            pcap_path,
-                            limit_packets=limit_packets,
-                            phase=p,
-                            total_packets=st.session_state.get("__total_pkts"),
-                            progress_every=250,
-                        )
-                p.done(
-                    "Packet parsing complete."
-                    if not st.session_state.get(f"skip_{make_slug('Parsing Packets')}", False)
-                    else "Parsing skipped."
+                result = _run_single_pcap_pipeline(
+                    pcap_path=str(file_path),
+                    tracker=file_tracker,
+                    phases=[(t, e) for t, e in phases if t != "LLM report"],
+                    limit_packets=limit_packets,
+                    osint_keys=osint_keys,
+                    osint_top_n=osint_top_n,
+                    do_pyshark=do_pyshark,
+                    do_zeek=do_zeek,
+                    do_carve=do_carve,
+                    pre_count=pre_count,
+                    do_yara=do_yara,
                 )
+                processor.add_result(result)
+                batch_tracker.finish_file()
+
+            # Cross-file correlation
+            batch_result = processor.merge_all()
+            st.session_state["__batch_result"] = batch_result
+
+            # Store merged results for dashboard compatibility
+            # Use the first successful result's features as base, merged with correlation data
+            first_ok = next((r for r in batch_result.pcap_results if not r.error), None)
+            if first_ok:
+                # Merge all features artifacts across files
+                merged_ips = set()
+                merged_domains = set()
+                merged_hashes = set()
+                merged_ja3 = set()
+                merged_macs = set()
+                all_flows = []
+                for r in batch_result.pcap_results:
+                    if r.error:
+                        continue
+                    arts = r.features.get("artifacts", {})
+                    merged_ips.update(arts.get("ips", []))
+                    merged_domains.update(arts.get("domains", []))
+                    merged_hashes.update(arts.get("hashes", []))
+                    merged_ja3.update(arts.get("ja3", []))
+                    merged_macs.update(arts.get("macs", []))
+                    all_flows.extend(r.features.get("flows", []))
+                merged_features = {
+                    "flows": all_flows,
+                    "artifacts": {
+                        "ips": uniq_sorted(merged_ips),
+                        "domains": uniq_sorted(merged_domains),
+                        "hashes": uniq_sorted(merged_hashes),
+                        "ja3": uniq_sorted(merged_ja3),
+                        "macs": uniq_sorted(merged_macs),
+                        "urls": [],
+                    },
+                }
+                st.session_state["features"] = merged_features
+            else:
+                st.session_state["features"] = {
+                    "flows": [],
+                    "artifacts": {"ips": [], "domains": [], "urls": [], "hashes": [], "ja3": []},
+                }
+
+            st.session_state["zeek_tables"] = batch_result.merged_zeek
+            st.session_state["osint"] = batch_result.merged_osint
+            st.session_state["beacon_df"] = batch_result.merged_beacons
+            st.session_state["dns_analysis"] = batch_result.aggregated_dns
+            st.session_state["tls_analysis"] = batch_result.aggregated_tls
+
+            # rDNS for merged IPs
+            from app.utils.network_utils import bulk_resolve_ips
+
+            merged_feats = st.session_state.get("features") or {}
+            _pub = [ip for ip in merged_feats.get("artifacts", {}).get("ips", []) if is_public_ipv4(ip)]
+            st.session_state["rdns_map"] = bulk_resolve_ips(_pub, max_workers=C.RDNS_MAX_WORKERS)
+
+            # Extract JA3 from merged Zeek
+            from app.pipeline.zeek import extract_ja3_from_zeek_tables
+
+            zeek_log_paths = {name: str(C.ZEEK_DIR / name) for name in batch_result.merged_zeek.keys()}
+            ja3_df, ja3_analysis = extract_ja3_from_zeek_tables(zeek_log_paths)
+            st.session_state["ja3_df"] = ja3_df
+            st.session_state["ja3_analysis"] = ja3_analysis
+
+            # Post-analysis on merged data
+            features = st.session_state.get("features") or {}
+            osint_data = st.session_state.get("osint") or {}
+            beacon_df = get_df_state("beacon_df")
+            try:
+                from app.analysis.correlation import correlate_indicators
+                from app.analysis.flow_analysis import detect_flow_asymmetry, detect_port_anomalies
+
+                correlations = correlate_indicators(
+                    features=features,
+                    osint=osint_data,
+                    beacon_df=beacon_df,
+                    dns_analysis=st.session_state.get("dns_analysis"),
+                    tls_analysis=st.session_state.get("tls_analysis"),
+                    yara_results=st.session_state.get("yara_results"),
+                )
+                st.session_state["correlations"] = correlations
+
+                if features.get("flows"):
+                    st.session_state["flow_asymmetry"] = detect_flow_asymmetry(features["flows"])
+                    st.session_state["port_anomalies"] = detect_port_anomalies(features["flows"])
+            except Exception as e:
+                logger.warning("Post-analysis failed: %s", e)
+
+            batch_tracker.finish_all(
+                f"Batch complete: {batch_result.summary['successful']}/{batch_result.summary['total_files']} files."
+            )
+
+        # ---- SINGLE FILE MODE ----
+        else:
+            total_phases = len(active_phases)
+            tracker = PhaseTracker(total_phases, progress_container=progress_panel)
+            tracker.update_overall("Running\u2026")
+
+            result = _run_single_pcap_pipeline(
+                pcap_path=pcap_path,
+                tracker=tracker,
+                phases=[(t, e) for t, e in phases if t != "LLM report"],
+                limit_packets=limit_packets,
+                osint_keys=osint_keys,
+                osint_top_n=osint_top_n,
+                do_pyshark=do_pyshark,
+                do_zeek=do_zeek,
+                do_carve=do_carve,
+                pre_count=pre_count,
+                do_yara=do_yara,
+            )
+
+            # Store results in session state
+            features = result.features
+            zeek_tables = result.zeek_tables
+            beacon_df = result.beacon_df if isinstance(result.beacon_df, pd.DataFrame) else pd.DataFrame()
+            osint_data = result.osint
+            carved = []  # carved is handled inside the pipeline now
+
             st.session_state["features"] = features
-
-        # Zeek
-        if dict(phases).get("Zeek processing", False):
-            p = tracker.next_phase("Zeek processing")
-            if not st.session_state.get(f"done_{make_slug('Zeek processing')}", False):
-                if not st.session_state.get(f"skip_{make_slug('Zeek processing')}", False):
-                    try:
-                        logs = run_zeek(pcap_path, C.ZEEK_DIR, phase=p)
-                    except Exception as e:
-                        st.error(f"Zeek failed: {e}")
-                        logs = {}
-                        p.done("Zeek failed.")
-                    if logs:
-                        total = len(logs)
-                        for i, (name, path) in enumerate(logs.items(), start=1):
-                            try:
-                                df = load_zeek_any(path)
-                            except Exception:
-                                df = pd.DataFrame()
-                            zeek_tables[name] = df.head(2000)
-                            p.set(80 + int(i / max(total, 1) * 20), f"Parsed {i}/{total} Zeek logs…")
-                p.done(
-                    "Zeek logs loaded."
-                    if not st.session_state.get(f"skip_{make_slug('Zeek processing')}", False)
-                    else "Zeek skipped."
-                )
             st.session_state["zeek_tables"] = zeek_tables
+            st.session_state["beacon_df"] = beacon_df
+            st.session_state["osint"] = osint_data
+            st.session_state["dns_analysis"] = result.dns_analysis or None
+            st.session_state["tls_analysis"] = result.tls_analysis or None
 
-            # Merge Zeek DNS queries into artifacts
-            from app.pipeline.zeek import merge_zeek_dns
+            # rDNS map for dashboard hostname display
+            from app.utils.network_utils import bulk_resolve_ips
 
-            features = merge_zeek_dns(zeek_tables, features)
-            st.session_state["features"] = features
+            _pub = [ip for ip in features.get("artifacts", {}).get("ips", []) if is_public_ipv4(ip)]
+            st.session_state["rdns_map"] = bulk_resolve_ips(_pub, max_workers=C.RDNS_MAX_WORKERS)
 
-            # Extract JA3 fingerprints from ssl.log
+            # Extract JA3
             from app.pipeline.zeek import extract_ja3_from_zeek_tables
 
             zeek_log_paths = {name: str(C.ZEEK_DIR / name) for name in zeek_tables.keys()}
@@ -333,115 +771,36 @@ with tab_progress:
             st.session_state["ja3_df"] = ja3_df
             st.session_state["ja3_analysis"] = ja3_analysis
 
-        # DNS Analysis
-        if dict(phases).get("DNS Analysis", False):
-            p = tracker.next_phase("DNS Analysis")
-            if not st.session_state.get(f"done_{make_slug('DNS Analysis')}", False):
-                if not st.session_state.get(f"skip_{make_slug('DNS Analysis')}", False):
-                    from app.pipeline.dns_analysis import analyze_dns
+            # Post-analysis
+            try:
+                from app.analysis.correlation import correlate_indicators
+                from app.analysis.flow_analysis import detect_flow_asymmetry, detect_port_anomalies
 
-                    with st.spinner("Analyzing DNS traffic..."):
-                        dns_result = analyze_dns(zeek_tables, features, phase=p)
-                        st.session_state["dns_analysis"] = dns_result
-                else:
-                    p.done("DNS analysis skipped.")
-                    st.session_state["dns_analysis"] = {"skipped": True}
-
-        # TLS Certificate Analysis
-        if dict(phases).get("TLS Certificate Analysis", False):
-            p = tracker.next_phase("TLS Certificate Analysis")
-            if not st.session_state.get(f"done_{make_slug('TLS Certificate Analysis')}", False):
-                if not st.session_state.get(f"skip_{make_slug('TLS Certificate Analysis')}", False):
-                    from app.pipeline.tls_certs import analyze_certificates
-
-                    with st.spinner("Extracting TLS certificates..."):
-                        tls_result = analyze_certificates(
-                            pcap_path=pcap_path,
-                            zeek_tables=zeek_tables,
-                            phase=p,
-                        )
-                        st.session_state["tls_analysis"] = tls_result
-                else:
-                    p.done("TLS analysis skipped.")
-                    st.session_state["tls_analysis"] = {"skipped": True}
-
-        # Beaconing
-        p = tracker.next_phase("Beaconing ranking")
-        if not st.session_state.get(f"done_{make_slug('Beaconing ranking')}", False):
-            if not st.session_state.get(f"skip_{make_slug('Beaconing ranking')}", False) and features.get("flows"):
-                p.set(30, "Scoring flows…")
-                beacon_df = rank_beaconing(features["flows"], top_n=20)
-                if not isinstance(beacon_df, pd.DataFrame):
-                    beacon_df = pd.DataFrame()
-                p.set(90, "Sorting top candidates…")
-            p.done(
-                "Beaconing step complete."
-                if not st.session_state.get(f"skip_{make_slug('Beaconing ranking')}", False)
-                else "Beaconing skipped."
-            )
-        st.session_state["beacon_df"] = beacon_df
-
-        # HTTP carving
-        if dict(phases).get("HTTP carving (tshark)", False):
-            p = tracker.next_phase("HTTP carving (tshark)")
-            if not st.session_state.get(f"done_{make_slug('HTTP carving (tshark)')}", False):
-                if not st.session_state.get(f"skip_{make_slug('HTTP carving (tshark)')}", False):
-                    with st.spinner("Carving HTTP payloads…"):
-                        carved = carve_http_payloads(pcap_path, C.CARVE_DIR, phase=p)
-                        carved = carved if isinstance(carved, list) else []
-                        for item in carved:
-                            h = item.get("sha256")
-                            if h:
-                                features["artifacts"]["hashes"].append(h)
-                        features["artifacts"]["hashes"] = uniq_sorted(features["artifacts"]["hashes"])
-                p.done(
-                    "HTTP carving complete."
-                    if not st.session_state.get(f"skip_{make_slug('HTTP carving (tshark)')}", False)
-                    else "HTTP carving skipped."
+                correlations = correlate_indicators(
+                    features=features,
+                    osint=osint_data,
+                    beacon_df=beacon_df,
+                    dns_analysis=st.session_state.get("dns_analysis"),
+                    tls_analysis=st.session_state.get("tls_analysis"),
+                    yara_results=st.session_state.get("yara_results"),
                 )
-            st.session_state["carved"] = carved
-            st.session_state["features"] = features
+                st.session_state["correlations"] = correlations
 
-        # YARA Scanning
-        if dict(phases).get("YARA Scanning", False):
-            p = tracker.next_phase("YARA Scanning")
-            if not st.session_state.get(f"done_{make_slug('YARA Scanning')}", False):
-                if not st.session_state.get(f"skip_{make_slug('YARA Scanning')}", False):
-                    from app.pipeline.yara_scan import scan_carved_files
+                if features.get("flows"):
+                    st.session_state["flow_asymmetry"] = detect_flow_asymmetry(features["flows"])
+                    st.session_state["port_anomalies"] = detect_port_anomalies(features["flows"])
+            except Exception as e:
+                logger.warning("Post-analysis failed: %s", e)
 
-                    with st.spinner("Scanning carved files with YARA..."):
-                        yara_results = scan_carved_files(carved, phase=p)
-                        st.session_state["yara_results"] = yara_results
-                else:
-                    p.done("YARA scanning skipped.")
-                    st.session_state["yara_results"] = {"skipped": True}
+        # ---- LLM REPORT (shared for single & batch) ----
+        features = st.session_state.get("features") or {}
+        zeek_tables = st.session_state.get("zeek_tables") or {}
+        beacon_df = get_df_state("beacon_df")
+        osint_data = st.session_state.get("osint") or {"ips": {}, "domains": {}, "ja3": {}}
+        report_md = st.session_state.get("report")
 
-        # OSINT
-        p = tracker.next_phase("OSINT enrichment")
-        if not st.session_state.get(f"done_{make_slug('OSINT enrichment')}", False):
-            if not st.session_state.get(f"skip_{make_slug('OSINT enrichment')}", False):
-                with st.spinner("OSINT enrichment…"):
-                    feats = (
-                        features
-                        if isinstance(features, dict)
-                        else {"flows": [], "artifacts": {"ips": [], "domains": [], "urls": [], "hashes": [], "ja3": []}}
-                    )
-                    arts = dict(feats.get("artifacts", {}))
-                    arts["ips"] = [ip for ip in arts.get("ips", []) if is_public_ipv4(ip)]
-                    if osint_top_n > 0:
-                        arts["ips"] = pick_top_public_ips(feats, osint_top_n)
-
-                    osint_data = osint_enrich(arts, osint_keys, phase=p)
-                    osint_data = osint_data if isinstance(osint_data, dict) else {"ips": {}, "domains": {}, "ja3": {}}
-            p.done(
-                "OSINT complete."
-                if not st.session_state.get(f"skip_{make_slug('OSINT enrichment')}", False)
-                else "OSINT skipped."
-            )
-        st.session_state["osint"] = osint_data
-
-        # LLM — pass FULL CONTEXT
-        p = tracker.next_phase("LLM report")
+        llm_tracker = PhaseTracker(1, progress_container=progress_panel)
+        p = llm_tracker.next_phase("LLM report")
 
         llm_slug = make_slug("LLM report")
         llm_done = st.session_state.get(f"done_{llm_slug}", False)
@@ -449,10 +808,10 @@ with tab_progress:
 
         if not llm_done:
             if not llm_skip:
-                with st.spinner("Generating LLM report via LM Studio…"):
+                with st.spinner("Generating LLM report via LM Studio\u2026"):
                     zeek_json = {
                         name: (df.to_dict(orient="records") if isinstance(df, pd.DataFrame) else [])
-                        for name, df in (zeek_tables or {}).items()
+                        for name, df in zeek_tables.items()
                     }
                     beacon_rows = []
                     try:
@@ -462,12 +821,13 @@ with tab_progress:
                         beacon_rows = []
 
                     context = {
-                        "features": features or {},
-                        "osint": osint_data or {},
+                        "features": features,
+                        "osint": osint_data,
                         "zeek": zeek_json,
                         "beaconing": beacon_rows,
-                        "carved": carved or [],
+                        "carved": st.session_state.get("carved") or [],
                         "packet_count": st.session_state.get("__total_pkts"),
+                        "correlations": st.session_state.get("correlations") or [],
                         "config": {
                             "limit_packets": limit_packets,
                             "do_pyshark": do_pyshark,
@@ -478,11 +838,18 @@ with tab_progress:
                         },
                     }
 
+                    # Include batch context if in batch mode
+                    if batch_mode and st.session_state.get("__batch_result"):
+                        br = st.session_state["__batch_result"]
+                        context["batch_summary"] = br.summary
+                        context["cross_file_indicators"] = [
+                            ind for ind in br.correlation.common_indicators[:20]
+                        ]
+
                     try:
-                        # FORCE REFRESH: Get latest language setting from session state
                         current_lang = st.session_state.get("cfg_lm_language", "US English")
-                        print(f"Generating report with language='{current_lang}'", flush=True)
-                        st.toast(f"Generating report in {current_lang}...", icon="📝")
+                        logger.debug("Generating report with language='%s'", current_lang)
+                        st.toast(f"Generating report in {current_lang}...", icon="\U0001f4dd")
 
                         report_md = generate_report(base_url, api_key, model, context, language=current_lang)
                     except Exception as e:
@@ -498,23 +865,42 @@ with tab_progress:
         st.session_state["report"] = report_md
 
         # End run
-        all_done = True
-        for title, enabled in phases:
-            if enabled and not st.session_state.get(f"done_{make_slug(title)}", False):
-                all_done = False
-                break
-        if all_done:
-            end_run()
+        end_run()
     else:
         st.info("Start in **Upload** tab, then return here to track progress.")
 
 # ---------------------- 3) Dashboard ----------------------
-# ---------------------- 3) Dashboard ----------------------
 with tab_dashboard:
     st.markdown("### Dashboard")
 
+    # Batch summary at the top when in batch mode
+    if st.session_state.get("__batch_mode") and st.session_state.get("__batch_result"):
+        batch_result = st.session_state["__batch_result"]
+        render_batch_summary(st.container(), batch_result.summary)
+        render_cross_file_correlation(st.container(), batch_result.correlation)
+        with st.expander("Per-File Details", expanded=False):
+            render_per_file_summary(st.container(), batch_result.pcap_results)
+        st.markdown("---")
+
+    # Threat summary at a glance
+    render_threat_summary(
+        st.container(),
+        correlations=st.session_state.get("correlations"),
+        beacon_df=get_df_state("beacon_df") if not get_df_state("beacon_df").empty else None,
+        yara_results=st.session_state.get("yara_results"),
+        tls_analysis=st.session_state.get("tls_analysis"),
+        dns_analysis=st.session_state.get("dns_analysis"),
+    )
+
     feats = st.session_state.get("features") or {}
     all_flows = feats.get("flows") or []
+
+    # IOC search bar at the top
+    render_ioc_search(
+        st.container(), feats, st.session_state.get("osint"),
+        st.session_state.get("dns_analysis"),
+        get_df_state("beacon_df") if not get_df_state("beacon_df").empty else None,
+    )
 
     # Initialize filter state
     if "filter_ips" not in st.session_state:
@@ -552,9 +938,12 @@ with tab_dashboard:
         active_filters.append("Time Range")
 
     if active_filters:
-        st.caption(
-            f"Active Filters: {' + '.join(active_filters)} | Showing {len(filtered_flows)} of {len(all_flows)} flows"
+        render_active_filters(
+            IPs=f"{len(st.session_state['filter_ips'])}" if st.session_state["filter_ips"] else None,
+            Protocols=", ".join(st.session_state["filter_protos"]) if st.session_state["filter_protos"] else None,
+            Time_Range="Active" if st.session_state["filter_time"] else None,
         )
+        st.caption(f"Showing {len(filtered_flows)} of {len(all_flows)} flows")
         if st.button("Clear All Filters", type="primary"):
             st.session_state["filter_ips"] = set()
             st.session_state["filter_protos"] = set()
@@ -568,9 +957,9 @@ with tab_dashboard:
 
     # Global toggle for excluding private IPs
     exclude_private = st.checkbox(
-        "Exclude Private IPs from Analysis", 
-        value=False, 
-        key="dashboard_exclude_private", 
+        "Exclude Private IPs from Analysis",
+        value=False,
+        key="dashboard_exclude_private",
         help="Ignore RFC1918 (local) addresses in Top 10 charts and map visualization."
     )
 
@@ -596,9 +985,21 @@ with tab_dashboard:
         home_lat = st.session_state.get("cfg_home_lat", 0.0)
         home_lon = st.session_state.get("cfg_home_lon", 0.0)
 
+        # Build threat scores lookup from correlations
+        _threat_scores: dict[str, float] = {}
+        for c in (st.session_state.get("correlations") or []):
+            if hasattr(c, "indicator") and hasattr(c, "composite_score"):
+                _threat_scores[c.indicator] = c.composite_score
+            elif isinstance(c, dict):
+                _threat_scores[c.get("indicator", "")] = c.get("composite_score", 0)
+
         # Render map with selection enabled
         map_event = st.plotly_chart(
-            plot_world_map(ip_locs, flows=filtered_flows, home_loc=(home_lat, home_lon)),
+            plot_world_map(
+                ip_locs, flows=filtered_flows,
+                home_loc=(home_lat, home_lon),
+                threat_scores=_threat_scores,
+            ),
             width="stretch",
             on_select="rerun",
             selection_mode=["points", "box", "lasso"],
@@ -617,6 +1018,7 @@ with tab_dashboard:
             if new_ips:
                 st.session_state["filter_ips"] = new_ips
                 st.rerun()
+        render_chart_hint("Click markers for IP details. Drag to select IPs. Scroll to zoom. Red=high threat.")
     else:
         st.info("No public IP locations found for map.")
 
@@ -652,6 +1054,7 @@ with tab_dashboard:
                     if selected_protos:
                         st.session_state["filter_protos"] = selected_protos
                         st.rerun()
+            render_chart_hint("Click a slice to filter by protocol. Click legend to hide/show.")
         else:
             st.info("No protocol data available.")
 
@@ -675,16 +1078,16 @@ with tab_dashboard:
                     times = []
                     for p in points:
                         tx = p.get("x")
-                        if tx:
+                        if tx is not None:
                             try:
-                                # Plotly/Streamlit often returns string "2023-..."
                                 dt = pd.to_datetime(tx)
                                 times.append(dt.timestamp())
-                            except Exception:
+                            except (ValueError, TypeError, OverflowError):
                                 continue
                     if times:
                         st.session_state["filter_time"] = (min(times), max(times))
                         st.rerun()
+            render_chart_hint("Hover for flow details. Drag to select time range. Bubble size = packet count.")
         else:
             st.info("No flow data available.")
 
@@ -715,8 +1118,10 @@ with tab_dashboard:
                 if dst:
                     if not exclude_private or is_public_ipv4(dst):
                         top_dst_ips[dst] = top_dst_ips.get(dst, 0) + 1
-                if dport: top_dst_ports[dport] = top_dst_ports.get(dport, 0) + 1
-                if proto: top_protos[proto] = top_protos.get(proto, 0) + 1
+                if dport:
+                    top_dst_ports[dport] = top_dst_ports.get(dport, 0) + 1
+                if proto:
+                    top_protos[proto] = top_protos.get(proto, 0) + 1
 
             # Domains from DNS analysis or Zeek logs
             dns_data = st.session_state.get("dns_analysis")
@@ -729,38 +1134,157 @@ with tab_dashboard:
                     domain_counts = dns_df["query"].value_counts().head(10).to_dict()
                     top_domains.update(domain_counts)
 
+            # rDNS map for hostname display
+            rdns = st.session_state.get("rdns_map", {})
+
             # Render Top 10s in columns
             tcol1, tcol2 = st.columns(2)
 
             with tcol1:
                 st.plotly_chart(plot_top_n_charts(top_src_ips, "Top 10 Source IPs"), width="stretch")
                 with st.expander("Source IP Table"):
-                    st.dataframe(pd.DataFrame(list(top_src_ips.items()), columns=["IP", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                    df_src = pd.DataFrame(list(top_src_ips.items()), columns=["IP", "Count"])
+                    df_src["Hostname"] = df_src["IP"].map(lambda ip: rdns.get(ip, ""))
+                    st.dataframe(df_src.sort_values("Count", ascending=False).head(10), hide_index=True)
 
                 st.plotly_chart(plot_top_n_charts(top_dst_ports, "Top 10 Destination Ports"), width="stretch")
                 with st.expander("Destination Port Table"):
-                    st.dataframe(pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                    df_ports = pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"])
+                    st.dataframe(df_ports.sort_values("Count", ascending=False).head(10), hide_index=True)
 
             with tcol2:
                 st.plotly_chart(plot_top_n_charts(top_dst_ips, "Top 10 Destination IPs"), width="stretch")
                 with st.expander("Destination IP Table"):
-                    st.dataframe(pd.DataFrame(list(top_dst_ips.items()), columns=["IP", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                    df_dst = pd.DataFrame(list(top_dst_ips.items()), columns=["IP", "Count"])
+                    df_dst["Hostname"] = df_dst["IP"].map(lambda ip: rdns.get(ip, ""))
+                    st.dataframe(df_dst.sort_values("Count", ascending=False).head(10), hide_index=True)
 
                 if top_domains:
                     st.plotly_chart(plot_top_n_charts(top_domains, "Top 10 Domains"), width="stretch")
                     with st.expander("Domain Table"):
-                        st.dataframe(pd.DataFrame(list(top_domains.items()), columns=["Domain", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                        df_dom = pd.DataFrame(list(top_domains.items()), columns=["Domain", "Count"])
+                        st.dataframe(df_dom.sort_values("Count", ascending=False).head(10), hide_index=True)
                 else:
                     st.plotly_chart(plot_top_n_charts(top_protos, "Top 10 Protocols"), width="stretch")
                     with st.expander("Protocol Table"):
-                        st.dataframe(pd.DataFrame(list(top_protos.items()), columns=["Protocol", "Count"]).sort_values("Count", ascending=False).head(10), hide_index=True, width="stretch")
+                        df_proto = pd.DataFrame(list(top_protos.items()), columns=["Protocol", "Count"])
+                        st.dataframe(df_proto.sort_values("Count", ascending=False).head(10), hide_index=True)
 
         else:
             st.info("Start analysis to see Top 10 metrics.")
 
 
+    # --- New Dashboard Sections ---
     st.markdown("---")
-    # render_report moved to tab_llm
+
+    # Correlation + Network graph side by side
+    dash_col1, dash_col2 = st.columns(2)
+    with dash_col1:
+        # Correlation results
+        render_correlation_results(st.container(), st.session_state.get("correlations"))
+
+        # Attack timeline (if available)
+        try:
+            from app.analysis.narrator import AttackNarrator
+
+            narrator = AttackNarrator()
+            timeline = narrator.create_timeline(
+                features=feats,
+                dns_analysis=st.session_state.get("dns_analysis"),
+                yara_results=st.session_state.get("yara_results"),
+                beacon_results=(
+                    get_df_state("beacon_df").to_dict("records")
+                    if not get_df_state("beacon_df").empty else []
+                ),
+                tls_analysis=st.session_state.get("tls_analysis"),
+            )
+            if timeline:
+                timeline_dicts = [e.to_dict() for e in timeline]
+                st.plotly_chart(
+                    plot_attack_timeline(timeline_dicts),
+                    use_container_width=True,
+                )
+                render_chart_hint("Diamond markers show events by severity and time.")
+        except Exception:
+            pass
+
+    with dash_col2:
+        # Network graph
+        if filtered_flows:
+            _ts = {}
+            for c in (st.session_state.get("correlations") or []):
+                if hasattr(c, "indicator"):
+                    _ts[c.indicator] = c.composite_score
+                elif isinstance(c, dict):
+                    _ts[c.get("indicator", "")] = c.get("composite_score", 0)
+            fig = plot_network_graph(filtered_flows, threat_scores=_ts)
+            if fig.data:
+                st.plotly_chart(fig, use_container_width=True)
+                render_chart_hint("Node size = connections. Color: blue=low, red=high threat.")
+
+    # --- Beaconing / YARA / TLS summaries on dashboard ---
+    _beacon = get_df_state("beacon_df")
+    _yara = st.session_state.get("yara_results")
+    _tls = st.session_state.get("tls_analysis")
+
+    detail_col1, detail_col2, detail_col3 = st.columns(3)
+
+    with detail_col1:
+        if not _beacon.empty and "score" in _beacon.columns:
+            high_beacons = _beacon[_beacon["score"] >= 0.5]
+            with st.expander(f"C2 Beaconing ({len(high_beacons)} candidates)", expanded=len(high_beacons) > 0):
+                if high_beacons.empty:
+                    st.caption("No high-confidence beacon candidates.")
+                else:
+                    show_cols = [c for c in ["dst", "score", "count"] if c in high_beacons.columns]
+                    display_df = high_beacons[show_cols].head(10).copy()
+                    if "dst" in display_df.columns:
+                        display_df["Hostname"] = display_df["dst"].map(lambda ip: rdns.get(ip, ""))
+                    st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    with detail_col2:
+        if _yara and isinstance(_yara, dict) and _yara.get("matched", 0) > 0:
+            with st.expander(f"YARA Detections ({_yara['matched']})", expanded=True):
+                matches = _yara.get("results", [])
+                for m in matches[:5]:
+                    rule = m.get("rule", "Unknown")
+                    severity = m.get("severity", "info")
+                    st.markdown(f"- **{rule}** ({severity})")
+        else:
+            with st.expander("YARA Detections (0)"):
+                st.caption("No YARA matches.")
+
+    with detail_col3:
+        if _tls and isinstance(_tls, dict):
+            ss = _tls.get("self_signed", 0) or 0
+            exp = _tls.get("expired", 0) or 0
+            total = ss + exp
+            with st.expander(f"TLS Certificate Risks ({total})", expanded=total > 0):
+                if total == 0:
+                    st.caption("No certificate issues detected.")
+                else:
+                    if ss:
+                        st.warning(f"{ss} self-signed certificate(s)")
+                    if exp:
+                        st.error(f"{exp} expired certificate(s)")
+        else:
+            with st.expander("TLS Certificate Risks (0)"):
+                st.caption("No TLS analysis data.")
+
+    st.markdown("---")
+
+    # Hunting checklist
+    render_hunting_checklist(
+        st.container(),
+        features=feats,
+        osint=st.session_state.get("osint"),
+        dns_analysis=st.session_state.get("dns_analysis"),
+        beacon_df=get_df_state("beacon_df") if not get_df_state("beacon_df").empty else None,
+        tls_analysis=st.session_state.get("tls_analysis"),
+        yara_results=st.session_state.get("yara_results"),
+    )
+
+    st.markdown("---")
 
 # 4) LLM Analysis ----------------------
 with tab_llm:
@@ -838,9 +1362,13 @@ with tab_results:
             st.session_state.get("ja3_df"),
             st.session_state.get("ja3_analysis"),
         )
+        render_nxdomain_analysis(results_panel, st.session_state.get("dns_analysis"))
+        render_query_velocity(results_panel, st.session_state.get("dns_analysis"))
         render_zeek(results_panel, st.session_state.get("zeek_tables") or {})
         render_carved(results_panel, st.session_state.get("carved") or [])
         render_yara_results(results_panel, st.session_state.get("yara_results"))
+        render_flow_asymmetry(results_panel, st.session_state.get("flow_asymmetry"))
+        render_port_anomalies(results_panel, st.session_state.get("port_anomalies"))
 
 # 6) Cases ----------------------
 with tab_cases:

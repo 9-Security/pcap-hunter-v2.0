@@ -76,7 +76,7 @@ def test_plot_flow_timeline():
     # Now includes an aggregate 'Volume' trace (area chart)
     # Total traces: 1 (Volume) + 2 (Protocols: TCP, UDP) = 3
     assert len(fig.data) == 3
-    
+
     # Check total points across all traces
     # TCP trace has 1 point, UDP has 1 point.
     # Volume trace covers the time range, typically 1 or more points depending on sampling.

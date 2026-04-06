@@ -13,6 +13,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_stix_value(value: str) -> str:
+    """Escape single quotes in STIX pattern values."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 # Try to import stix2 library
 try:
     import stix2
@@ -76,31 +82,30 @@ class STIXExporter:
 
     def _ioc_to_pattern(self, ioc: "IOCRecord") -> str | None:
         """Convert IOC to STIX pattern."""
+        escaped = _escape_stix_value(ioc.value)
         if ioc.ioc_type == "ip":
             # Check if IPv6
             if ":" in ioc.value:
-                return f"[ipv6-addr:value = '{ioc.value}']"
-            return f"[ipv4-addr:value = '{ioc.value}']"
+                return f"[ipv6-addr:value = '{escaped}']"
+            return f"[ipv4-addr:value = '{escaped}']"
         elif ioc.ioc_type == "domain":
-            return f"[domain-name:value = '{ioc.value}']"
+            return f"[domain-name:value = '{escaped}']"
         elif ioc.ioc_type == "hash":
             # Determine hash type by length
             hash_len = len(ioc.value)
             if hash_len == 32:
-                return f"[file:hashes.MD5 = '{ioc.value}']"
+                return f"[file:hashes.MD5 = '{escaped}']"
             elif hash_len == 40:
-                return f"[file:hashes.'SHA-1' = '{ioc.value}']"
+                return f"[file:hashes.'SHA-1' = '{escaped}']"
             elif hash_len == 64:
-                return f"[file:hashes.'SHA-256' = '{ioc.value}']"
+                return f"[file:hashes.'SHA-256' = '{escaped}']"
             elif hash_len == 128:
-                return f"[file:hashes.'SHA-512' = '{ioc.value}']"
+                return f"[file:hashes.'SHA-512' = '{escaped}']"
         elif ioc.ioc_type == "url":
-            # Escape single quotes in URL
-            escaped_url = ioc.value.replace("'", "\\'")
-            return f"[url:value = '{escaped_url}']"
+            return f"[url:value = '{escaped}']"
         elif ioc.ioc_type == "ja3":
             # JA3 as x509 extension (non-standard but useful)
-            return f"[x509-certificate:hashes.'JA3' = '{ioc.value}']"
+            return f"[x509-certificate:hashes.'JA3' = '{escaped}']"
 
         return None
 

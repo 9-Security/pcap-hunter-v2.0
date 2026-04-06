@@ -48,6 +48,9 @@ class ConfigManager:
     derived from a machine-specific key.
     """
 
+    # Legacy static salt for backward compatibility with existing configs
+    _LEGACY_SALT = b"pcap_hunter_v1_salt"
+
     def __init__(self, config_path: str | Path | None = None):
         """
         Initialize the config manager.
@@ -58,12 +61,34 @@ class ConfigManager:
         if config_path is None:
             config_path = Path.home() / ".pcap_hunter_config.json"
         self.config_path = Path(config_path)
-        self._fernet = self._create_fernet()
+        self._salt = self._load_or_create_salt()
+        self._fernet = self._create_fernet(self._salt)
         self.defaults = DEFAULT_CONFIG.copy()
 
-    def _create_fernet(self) -> Fernet:
+    def _load_or_create_salt(self) -> bytes:
+        """Load salt from existing config or generate a new one.
+
+        On first run (no config file), generates a random 16-byte salt.
+        On subsequent runs, reads the stored salt from the config JSON.
+        Falls back to legacy static salt for configs that lack a stored salt.
+        """
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                salt_b64 = saved.get("_salt")
+                if salt_b64:
+                    return base64.b64decode(salt_b64)
+                # Existing config without _salt — use legacy salt for backward compatibility
+                return self._LEGACY_SALT
+            except (json.JSONDecodeError, IOError):
+                return self._LEGACY_SALT
+        # New config — generate random salt
+        return os.urandom(16)
+
+    def _create_fernet(self, salt: bytes) -> Fernet:
         """Create Fernet instance with machine-derived key."""
-        # Use machine-specific salt (hostname + username)
+        # Use machine-specific identity (hostname + username)
         # platform.node() is cross-platform (works on Windows, macOS, Linux)
         machine_id = f"{os.getenv('USER', os.getenv('USERNAME', 'user'))}@{platform.node()}".encode()
 
@@ -71,7 +96,7 @@ class ConfigManager:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b"pcap_hunter_v1_salt",  # Static salt for consistency
+            salt=salt,
             iterations=100000,
         )
         key = base64.urlsafe_b64encode(kdf.derive(machine_id))
@@ -112,6 +137,8 @@ class ConfigManager:
 
             # Merge saved values with defaults
             for key, value in saved.items():
+                if key == "_salt":
+                    continue  # Internal key, not exposed in config
                 if key in SENSITIVE_KEYS:
                     config[key] = self._decrypt(value)
                 else:
@@ -139,7 +166,12 @@ class ConfigManager:
 
         to_save = {}
 
+        # Persist the salt so it can be loaded on next run
+        to_save["_salt"] = base64.b64encode(self._salt).decode("ascii")
+
         for key, value in config.items():
+            if key == "_salt":
+                continue  # Skip user-supplied _salt; we manage it internally
             if key in SENSITIVE_KEYS:
                 to_save[key] = self._encrypt(str(value) if value else "")
             else:

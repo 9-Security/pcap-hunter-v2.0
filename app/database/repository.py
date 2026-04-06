@@ -315,7 +315,7 @@ class CaseRepository:
     def clear_all(self) -> bool:
         """
         Clear all data from all tables. Use with caution.
-        
+
         Returns:
             True if cleared successfully.
         """

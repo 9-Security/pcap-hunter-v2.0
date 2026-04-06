@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from app.utils.export import _sanitize_csv_value
+
 # Namespace UUID for deterministic STIX ID generation
 STIX_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
@@ -245,12 +247,12 @@ class IOCExporter:
         for ioc in iocs:
             writer.writerow(
                 [
-                    ioc.ioc_type,
-                    ioc.value,
-                    ioc.context,
+                    _sanitize_csv_value(ioc.ioc_type),
+                    _sanitize_csv_value(ioc.value),
+                    _sanitize_csv_value(ioc.context),
                     f"{ioc.priority_score:.2f}",
-                    "; ".join(ioc.tags),
-                    json.dumps(ioc.osint_summary) if ioc.osint_summary else "",
+                    _sanitize_csv_value("; ".join(ioc.tags)),
+                    _sanitize_csv_value(json.dumps(ioc.osint_summary) if ioc.osint_summary else ""),
                 ]
             )
 
@@ -366,20 +368,23 @@ class IOCExporter:
 
     def _ioc_to_stix_pattern(self, ioc: IOCRecord) -> str | None:
         """Convert IOC to STIX pattern."""
+        from app.utils.stix_export import _escape_stix_value
+
+        escaped = _escape_stix_value(ioc.value)
         if ioc.ioc_type == "ip":
-            return f"[ipv4-addr:value = '{ioc.value}']"
+            return f"[ipv4-addr:value = '{escaped}']"
         elif ioc.ioc_type == "domain":
-            return f"[domain-name:value = '{ioc.value}']"
+            return f"[domain-name:value = '{escaped}']"
         elif ioc.ioc_type == "hash":
             # Determine hash type by length
             if len(ioc.value) == 32:
-                return f"[file:hashes.MD5 = '{ioc.value}']"
+                return f"[file:hashes.MD5 = '{escaped}']"
             elif len(ioc.value) == 40:
-                return f"[file:hashes.'SHA-1' = '{ioc.value}']"
+                return f"[file:hashes.'SHA-1' = '{escaped}']"
             elif len(ioc.value) == 64:
-                return f"[file:hashes.'SHA-256' = '{ioc.value}']"
+                return f"[file:hashes.'SHA-256' = '{escaped}']"
         elif ioc.ioc_type == "url":
-            return f"[url:value = '{ioc.value}']"
+            return f"[url:value = '{escaped}']"
         elif ioc.ioc_type == "ja3":
             # JA3 doesn't have a standard STIX pattern
             return None

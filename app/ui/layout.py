@@ -24,10 +24,10 @@ def inject_css():
         .phase-row .stButton>button { height: 38px; }
         .phase-row .stProgress { margin-top: 6px; }
         .section-title { margin-top: .75rem; margin-bottom: .5rem; }
-        .dashboard-card { 
-            border: 1px solid rgba(255, 255, 255, 0.05); 
-            border-radius: 12px; 
-            padding: 1.25rem; 
+        .dashboard-card {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 1.25rem;
             background-color: rgba(255, 255, 255, 0.02);
             margin-bottom: 1rem;
         }
@@ -35,6 +35,24 @@ def inject_css():
             background: linear-gradient(135deg, rgba(74, 144, 226, 0.1), rgba(0,0,0,0));
             border-left: 3px solid #4A90E2;
         }
+        .chart-hint {
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 0.78rem;
+            font-style: italic;
+            margin-top: -0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .filter-badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            margin: 0.15rem;
+            border-radius: 12px;
+            background: rgba(74, 144, 226, 0.15);
+            border: 1px solid rgba(74, 144, 226, 0.3);
+            font-size: 0.8rem;
+            color: #AAA;
+        }
+        .hunt-item { margin-bottom: 0.3rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -87,7 +105,11 @@ def render_export_buttons(data, prefix: str, key_suffix: str = "", is_dataframe:
 
 def make_tabs():
     """Top tabs: Upload • Progress • Dashboard • LLM Analysis • OSINT • Results • Cases • Config."""
-    tabs = st.tabs(["📤 Upload", "📈 Progress", "📊 Dashboard", "🤖 LLM Analysis", "🕵️ OSINT", "📋 Raw Data", "📁 Cases", "⚙️ Config"])
+    tab_names = [
+        "📤 Upload", "📈 Progress", "📊 Dashboard", "🤖 LLM Analysis",
+        "🕵️ OSINT", "📋 Raw Data", "📁 Cases", "⚙️ Config",
+    ]
+    tabs = st.tabs(tab_names)
     return tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6], tabs[7]
 
 
@@ -104,6 +126,113 @@ def make_results_panel(container):
 
 
 # ---------------- Results renderers ----------------
+
+
+def render_threat_summary(
+    container,
+    correlations: list | None,
+    beacon_df=None,
+    yara_results: dict | None = None,
+    tls_analysis: dict | None = None,
+    dns_analysis: dict | None = None,
+):
+    """Render an at-a-glance threat summary panel at the top of the dashboard."""
+    with container:
+        # --- Count threats by category ---
+        critical = high = medium = low = 0
+        if correlations:
+            for c in correlations:
+                v = (c.verdict if hasattr(c, "verdict") else c.get("verdict", "low")).lower()
+                if v == "critical":
+                    critical += 1
+                elif v == "high":
+                    high += 1
+                elif v == "medium":
+                    medium += 1
+                else:
+                    low += 1
+
+        beacon_count = 0
+        if beacon_df is not None and not beacon_df.empty and "score" in beacon_df.columns:
+            beacon_count = int((beacon_df["score"] >= 0.6).sum())
+
+        yara_count = 0
+        if yara_results and isinstance(yara_results, dict):
+            yara_count = yara_results.get("matched", 0)
+
+        tls_issues = 0
+        if tls_analysis and isinstance(tls_analysis, dict):
+            tls_issues = (tls_analysis.get("self_signed", 0) or 0) + (tls_analysis.get("expired", 0) or 0)
+
+        dns_alerts = 0
+        if dns_analysis and isinstance(dns_analysis, dict):
+            alerts = dns_analysis.get("alerts", {})
+            dns_alerts = (alerts.get("dga_count", 0) or 0) + (alerts.get("tunneling_count", 0) or 0)
+
+        total_alerts = critical + high + beacon_count + yara_count + tls_issues + dns_alerts
+
+        # Determine overall risk level.
+        # Beacons alone do not escalate to HIGH — many benign patterns
+        # (ICMP health-checks, TLS keep-alives, NTP) trigger beacon scoring.
+        # Require corroborating evidence (OSINT high, YARA hits, or multiple
+        # beacon candidates with high scores) before escalating.
+        # Corroboration count — how many distinct signal categories fired
+        corroboration = sum([
+            beacon_count > 0,
+            yara_count > 0,
+            tls_issues > 0,
+            dns_alerts > 0,
+            high > 0 or critical > 0,
+        ])
+
+        if critical > 0:
+            risk, color = "CRITICAL", "#ff6b6b"
+        elif high > 0 or yara_count > 0:
+            risk, color = "HIGH", "#ffa94d"
+        elif medium > 0 or (beacon_count >= 3 and corroboration >= 2) or (tls_issues > 0 and dns_alerts > 0):
+            risk, color = "MEDIUM", "#ffd43b"
+        elif correlations or beacon_count > 0 or tls_issues > 0 or dns_alerts > 0:
+            risk, color = "LOW", "#51cf66"
+        else:
+            risk, color = "N/A", "#adb5bd"
+
+        # --- Render ---
+        st.markdown(
+            f'<div class="dashboard-card" style="border-left: 4px solid {color}; padding: 1rem;">'
+            f"<strong>Threat Summary</strong></div>",
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.metric("Risk Level", risk)
+        with c2:
+            st.metric("Alerts", total_alerts)
+        with c3:
+            st.metric("Beacons", beacon_count)
+        with c4:
+            st.metric("YARA Hits", yara_count)
+        with c5:
+            st.metric("Cert Issues", tls_issues)
+
+        # One-line detail
+        parts = []
+        if critical:
+            parts.append(f"{critical} critical")
+        if high:
+            parts.append(f"{high} high-risk IPs")
+        if beacon_count:
+            parts.append(f"{beacon_count} beacon candidates")
+        if yara_count:
+            parts.append(f"{yara_count} YARA matches")
+        if tls_issues:
+            parts.append(f"{tls_issues} cert issues")
+        if dns_alerts:
+            parts.append(f"{dns_alerts} DNS alerts")
+        if parts:
+            st.caption(" | ".join(parts))
+        elif correlations:
+            st.caption("No high-severity indicators detected.")
 
 
 def render_overview(result_col, features):
@@ -244,11 +373,11 @@ def render_osint(result_col, osint_data):
                 city = obj.get("city", "n/a")
                 country = obj.get("country", "n/a")
                 ip_rows.append({
-                    "IP": ip, 
+                    "IP": ip,
                     "Country": country,
                     "City": city,
-                    "PTR": ptr, 
-                    "GreyNoise": gn, 
+                    "PTR": ptr,
+                    "GreyNoise": gn,
                     "VT Rep": vt_rep
                 })
 
@@ -650,6 +779,61 @@ def render_batch_summary(result_col, batch_summary: dict | None):
                     st.text(f"- {fname}")
 
 
+def render_cross_file_correlation(result_col, correlation):
+    """Render shared IPs, domains, JA3 across multiple PCAP files."""
+    with result_col:
+        if correlation is None:
+            return
+
+        common = getattr(correlation, "common_indicators", [])
+        if not common:
+            st.info("No shared indicators found across files.")
+            return
+
+        st.markdown("#### Cross-File Indicators")
+        st.caption("Indicators observed in two or more PCAP files")
+
+        rows = []
+        for ind in common:
+            rows.append(
+                {
+                    "Type": ind.get("type", "").upper(),
+                    "Value": ind.get("value", ""),
+                    "Files": ind.get("file_count", 0),
+                    "Seen In": ", ".join(ind.get("files", [])),
+                }
+            )
+        if rows:
+            df = pd.DataFrame(rows)
+            st.dataframe(df, hide_index=True, use_container_width=True)
+
+
+def render_per_file_summary(result_col, pcap_results: list):
+    """Render collapsible per-file result cards for batch processing."""
+    with result_col:
+        if not pcap_results:
+            return
+
+        st.markdown("#### Per-File Results")
+        for r in pcap_results:
+            status = "Failed" if r.error else "OK"
+            icon = "\u274c" if r.error else "\u2705"
+            label = f"{icon} {r.filename} \u2014 {status}"
+            with st.expander(label, expanded=bool(r.error)):
+                if r.error:
+                    st.error(f"Error: {r.error}")
+                    continue
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Packets", f"{r.packet_count:,}" if r.packet_count else "N/A")
+                with c2:
+                    st.metric("Flows", f"{len(r.features.get('flows', [])):,}")
+                with c3:
+                    st.metric("IPs", f"{len(r.features.get('artifacts', {}).get('ips', [])):,}")
+                with c4:
+                    st.metric("Domains", f"{len(r.features.get('artifacts', {}).get('domains', [])):,}")
+
+
 def render_yara_results(result_col, yara_results: dict | None):
     """Render YARA scan results for carved files."""
     with result_col:
@@ -1037,3 +1221,410 @@ def render_qa_interface(result_col, qa_session):
                 if st.button("Clear History", key="qa_clear"):
                     qa_session.clear_history()
                     st.rerun()
+
+
+# -------------- New UI Components ------------------
+
+
+def render_chart_hint(hint: str):
+    """Render a subtle interaction hint below a chart."""
+    st.markdown(f'<p class="chart-hint">{hint}</p>', unsafe_allow_html=True)
+
+
+def render_active_filters(**filters):
+    """Render active filter badges at the top of the dashboard.
+
+    Args:
+        **filters: keyword args like min_beacon=0.5, protocol="TCP"
+    """
+    active = {k: v for k, v in filters.items() if v is not None and v != "" and v != 0}
+    if not active:
+        return
+
+    badges = " ".join(
+        f'<span class="filter-badge">{k.replace("_", " ").title()}: {v}</span>'
+        for k, v in active.items()
+    )
+    st.markdown(f"**Active Filters:** {badges}", unsafe_allow_html=True)
+
+
+def render_ioc_search(
+    result_col,
+    features: dict | None,
+    osint: dict | None,
+    dns_analysis: dict | None = None,
+    beacon_df=None,
+):
+    """Render a global IOC search bar that searches across all analysis results."""
+    with result_col:
+        query = st.text_input(
+            "Search IOCs",
+            placeholder="Search IPs, domains, JA3 hashes...",
+            key="ioc_search_input",
+        )
+
+        if not query or len(query) < 2:
+            return
+
+        query_lower = query.lower().strip()
+        results_found = False
+
+        # Search IPs
+        if features:
+            ips = features.get("artifacts", {}).get("ips", [])
+            matched_ips = [ip for ip in ips if query_lower in ip.lower()]
+            if matched_ips:
+                results_found = True
+                with st.expander(f"IPs ({len(matched_ips)} matches)", expanded=True):
+                    for ip in matched_ips[:10]:
+                        osint_ip = (osint or {}).get("ips", {}).get(ip, {})
+                        gn = osint_ip.get("greynoise", {}).get(
+                            "classification", "n/a"
+                        )
+                        ptr = osint_ip.get("ptr", "n/a")
+                        st.markdown(
+                            f"**{ip}** — PTR: {ptr}, GreyNoise: {gn}"
+                        )
+
+        # Search domains
+        if features:
+            domains = features.get("artifacts", {}).get("domains", [])
+            matched_doms = [d for d in domains if query_lower in d.lower()]
+            if matched_doms:
+                results_found = True
+                with st.expander(
+                    f"Domains ({len(matched_doms)} matches)", expanded=True
+                ):
+                    for dom in matched_doms[:10]:
+                        # Check DNS analysis
+                        dga_hit = ""
+                        if dns_analysis:
+                            for dga in dns_analysis.get("dga_detections", []):
+                                if dga.get("domain") == dom and dga.get("is_dga"):
+                                    dga_hit = " **[DGA]**"
+                                    break
+                        st.markdown(f"**{dom}**{dga_hit}")
+
+        # Search JA3 hashes
+        if features:
+            ja3s = features.get("artifacts", {}).get("ja3", [])
+            if isinstance(ja3s, list):
+                matched_ja3 = [
+                    j for j in ja3s
+                    if isinstance(j, str) and query_lower in j.lower()
+                ]
+                if matched_ja3:
+                    results_found = True
+                    with st.expander(
+                        f"JA3 ({len(matched_ja3)} matches)", expanded=True
+                    ):
+                        for j in matched_ja3[:10]:
+                            st.code(j)
+
+        # Search beacon destinations
+        if beacon_df is not None and not beacon_df.empty:
+            try:
+                mask = beacon_df["dst"].str.contains(
+                    query_lower, case=False, na=False
+                )
+                matched = beacon_df[mask]
+                if not matched.empty:
+                    results_found = True
+                    with st.expander(
+                        f"Beacon Candidates ({len(matched)} matches)",
+                        expanded=True,
+                    ):
+                        st.dataframe(
+                            matched[["src", "dst", "dport", "score"]],
+                            hide_index=True,
+                        )
+            except Exception:
+                pass
+
+        if not results_found:
+            st.caption(f"No results for '{query}'")
+
+
+def render_hunting_checklist(
+    result_col,
+    features: dict | None = None,
+    osint: dict | None = None,
+    dns_analysis: dict | None = None,
+    beacon_df=None,
+    tls_analysis: dict | None = None,
+    yara_results: dict | None = None,
+):
+    """Render an auto-generated threat hunting checklist based on findings."""
+    with result_col:
+        items: list[tuple[str, str]] = []
+
+        # Beacon candidates
+        if beacon_df is not None and not beacon_df.empty:
+            high_beacons = beacon_df[beacon_df["score"] >= 0.5]
+            if not high_beacons.empty:
+                items.append((
+                    f"Review {len(high_beacons)} beacon candidates "
+                    f"(score >= 0.5)",
+                    "beacon",
+                ))
+
+        # DGA domains
+        if dns_analysis:
+            alerts = dns_analysis.get("alerts", {})
+            dga_count = alerts.get("dga_count", 0)
+            if dga_count:
+                items.append((
+                    f"Investigate {dga_count} potential DGA domains",
+                    "dns",
+                ))
+            tunnel_count = alerts.get("tunneling_count", 0)
+            if tunnel_count:
+                items.append((
+                    f"Check {tunnel_count} DNS tunneling indicators",
+                    "dns",
+                ))
+            if alerts.get("nxdomain_suspicious"):
+                ratio = alerts.get("nxdomain_ratio", 0)
+                items.append((
+                    f"High NXDOMAIN ratio ({ratio:.0%}) — possible DGA/C2",
+                    "dns",
+                ))
+
+        # TLS alerts
+        if tls_analysis:
+            self_signed = tls_analysis.get("self_signed", 0)
+            expired = tls_analysis.get("expired", 0)
+            if self_signed:
+                items.append((
+                    f"Examine {self_signed} self-signed certificates",
+                    "tls",
+                ))
+            if expired:
+                items.append((
+                    f"Check {expired} expired certificates",
+                    "tls",
+                ))
+
+        # YARA matches
+        if yara_results and yara_results.get("matched", 0) > 0:
+            matched = yara_results["matched"]
+            items.append((
+                f"Analyse {matched} YARA match(es) in carved payloads",
+                "yara",
+            ))
+
+        # OSINT high-risk
+        if osint:
+            malicious_ips = 0
+            for ip, data in osint.get("ips", {}).items():
+                gn = data.get("greynoise", {}).get("classification", "")
+                if gn == "malicious":
+                    malicious_ips += 1
+            if malicious_ips:
+                items.append((
+                    f"Block/investigate {malicious_ips} malicious IPs "
+                    f"(GreyNoise)",
+                    "osint",
+                ))
+
+        if not items:
+            return
+
+        with st.expander("Threat Hunting Checklist", expanded=True):
+            for i, (text, category) in enumerate(items):
+                key = f"hunt_check_{i}"
+                st.checkbox(
+                    text,
+                    value=st.session_state.get(key, False),
+                    key=key,
+                )
+
+
+def render_correlation_results(result_col, correlations: list | None):
+    """Render cross-indicator correlation results."""
+    with result_col:
+        if not correlations:
+            return
+
+        with st.expander("Cross-Indicator Correlations", expanded=True):
+            st.markdown("**Top Correlated Threats:**")
+
+            rows = []
+            for c in correlations[:20]:
+                if hasattr(c, "to_dict"):
+                    d = c.to_dict()
+                else:
+                    d = c
+                rows.append({
+                    "Indicator": d.get("indicator", ""),
+                    "Type": d.get("type", ""),
+                    "Score": f"{d.get('composite_score', 0):.1%}",
+                    "Verdict": d.get("verdict", "").upper(),
+                    "Signals": d.get("signal_count", 0),
+                })
+
+            if rows:
+                df = pd.DataFrame(rows)
+
+                def highlight_verdict(row):
+                    v = row.get("Verdict", "").lower()
+                    if v == "critical":
+                        return ["background-color: #ff6b6b"] * len(row)
+                    elif v == "high":
+                        return ["background-color: #ffa94d"] * len(row)
+                    elif v == "medium":
+                        return ["background-color: #ffd43b"] * len(row)
+                    return [""] * len(row)
+
+                styled_df = df.style.apply(highlight_verdict, axis=1)
+                st.dataframe(
+                    styled_df, width="stretch", hide_index=True
+                )
+
+
+def render_flow_asymmetry(result_col, asymmetry_results: list | None):
+    """Render flow asymmetry (data exfiltration) detection results."""
+    with result_col:
+        if not asymmetry_results:
+            return
+
+        suspicious = [
+            r for r in asymmetry_results
+            if (hasattr(r, "is_suspicious") and r.is_suspicious)
+            or (isinstance(r, dict) and r.get("is_suspicious"))
+        ]
+        if not suspicious:
+            return
+
+        expanded = len(suspicious) > 0
+        with st.expander(
+            f"Flow Asymmetry ({len(suspicious)} suspicious)", expanded=expanded
+        ):
+            st.warning(
+                f"**Data Exfiltration Risk:** {len(suspicious)} flow pairs "
+                f"show asymmetric traffic patterns."
+            )
+
+            rows = []
+            for r in suspicious[:20]:
+                d = r.to_dict() if hasattr(r, "to_dict") else r
+                out_mb = d.get("outbound_bytes", 0) / 1_000_000
+                in_mb = d.get("inbound_bytes", 0) / 1_000_000
+                rows.append({
+                    "Source": d.get("src", ""),
+                    "Destination": d.get("dst", ""),
+                    "Outbound": f"{out_mb:.1f} MB",
+                    "Inbound": f"{in_mb:.1f} MB",
+                    "Ratio": f"{d.get('ratio', 0):.1f}:1",
+                    "Score": f"{d.get('score', 0):.1%}",
+                    "Reason": d.get("reason", ""),
+                })
+
+            if rows:
+                df = pd.DataFrame(rows)
+                render_export_buttons(
+                    df, "flow_asymmetry",
+                    key_suffix="asymm", is_dataframe=True,
+                )
+                st.dataframe(df, width="stretch", hide_index=True)
+
+
+def render_port_anomalies(result_col, anomaly_results: list | None):
+    """Render port/protocol anomaly detection results."""
+    with result_col:
+        if not anomaly_results:
+            return
+
+        with st.expander(
+            f"Port Anomalies ({len(anomaly_results)})", expanded=bool(anomaly_results)
+        ):
+            rows = []
+            for r in anomaly_results[:30]:
+                d = r.to_dict() if hasattr(r, "to_dict") else r
+                rows.append({
+                    "Source": d.get("src", ""),
+                    "Destination": d.get("dst", ""),
+                    "Port": d.get("port", ""),
+                    "Proto": d.get("proto", ""),
+                    "Type": d.get("anomaly_type", "").replace("_", " ").title(),
+                    "Score": f"{d.get('score', 0):.1%}",
+                    "Reason": d.get("reason", ""),
+                })
+
+            if rows:
+                df = pd.DataFrame(rows)
+                render_export_buttons(
+                    df, "port_anomalies",
+                    key_suffix="port", is_dataframe=True,
+                )
+                st.dataframe(df, width="stretch", hide_index=True)
+
+
+def render_nxdomain_analysis(result_col, dns_analysis: dict | None):
+    """Render NXDOMAIN analysis section."""
+    with result_col:
+        if not dns_analysis:
+            return
+
+        nxd = dns_analysis.get("nxdomain_analysis", {})
+        if not nxd or nxd.get("nxdomain_count", 0) == 0:
+            return
+
+        expanded = nxd.get("is_suspicious", False)
+        with st.expander("NXDOMAIN Analysis", expanded=expanded):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("NXDOMAIN Count", nxd.get("nxdomain_count", 0))
+            with col2:
+                ratio = nxd.get("nxdomain_ratio", 0)
+                if nxd.get("is_suspicious"):
+                    st.metric(
+                        "NXDOMAIN Ratio", f"{ratio:.1%}",
+                        delta="Suspicious", delta_color="inverse",
+                    )
+                else:
+                    st.metric("NXDOMAIN Ratio", f"{ratio:.1%}")
+            with col3:
+                suspicious_src = sum(
+                    1 for s in nxd.get("sources", [])
+                    if s.get("is_suspicious")
+                )
+                st.metric("Suspicious Sources", suspicious_src)
+
+            if nxd.get("is_suspicious"):
+                st.warning(
+                    "High NXDOMAIN ratio may indicate DGA activity, "
+                    "domain enumeration, or C2 communication attempts."
+                )
+
+            sources = nxd.get("sources", [])
+            if sources:
+                st.markdown("**Top NXDOMAIN Sources:**")
+                df = pd.DataFrame(sources)
+                st.dataframe(df, width="stretch", hide_index=True)
+
+
+def render_query_velocity(result_col, dns_analysis: dict | None):
+    """Render DNS query velocity analysis."""
+    with result_col:
+        if not dns_analysis:
+            return
+
+        velocity = dns_analysis.get("query_velocity", [])
+        if not velocity:
+            return
+
+        suspicious = [v for v in velocity if v.get("is_suspicious")]
+        if not suspicious:
+            return
+
+        with st.expander(
+            f"DNS Query Velocity ({len(suspicious)} high-rate sources)",
+            expanded=True,
+        ):
+            st.warning(
+                "Sustained high DNS query rates may indicate "
+                "DNS tunneling or data exfiltration."
+            )
+            df = pd.DataFrame(suspicious)
+            st.dataframe(df, width="stretch", hide_index=True)

@@ -342,15 +342,15 @@ class TestCaseRepository:
         """Test clearing all data from repository."""
         # Create some data
         c1 = repo.create_case(Case(title="Case 1"))
-        c2 = repo.create_case(Case(title="Case 2"))
+        repo.create_case(Case(title="Case 2"))
         repo.add_note(c1, "Note 1")
         repo.save_analysis(Analysis(case_id=c1, pcap_path="/p1.pcap"))
-        
+
         assert len(repo.list_cases()) == 2
-        
+
         # Clear all
         assert repo.clear_all() is True
-        
+
         # Verify empty
         assert len(repo.list_cases()) == 0
         assert repo.get_case(c1) is None

@@ -101,7 +101,7 @@ def export_to_json(data: Any, filename: str | None = None, indent: int = 2) -> b
 
 def export_dataframe_to_csv(df, filename: str | None = None) -> bytes:
     """
-    Export pandas DataFrame to CSV bytes.
+    Export pandas DataFrame to CSV bytes with injection protection.
 
     Args:
         df: pandas DataFrame
@@ -110,9 +110,20 @@ def export_dataframe_to_csv(df, filename: str | None = None) -> bytes:
     Returns:
         UTF-8 encoded CSV bytes
     """
+    import pandas as pd
+
     if df is None or df.empty:
         return b""
-    return df.to_csv(index=False).encode("utf-8")
+
+    # Apply CSV injection sanitization to all string columns
+    sanitized = df.copy()
+    for col in sanitized.select_dtypes(include=["object"]).columns:
+        sanitized[col] = sanitized[col].apply(
+            lambda x: _sanitize_csv_value(str(x)) if pd.notna(x) else x
+        )
+    buf = io.StringIO()
+    sanitized.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
 
 
 def export_dataframe_to_json(df, filename: str | None = None, indent: int = 2) -> bytes:

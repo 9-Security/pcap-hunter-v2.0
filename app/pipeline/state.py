@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import time
 from typing import Optional
 
@@ -119,3 +120,43 @@ class PhaseHandle:
                 self.bar.progress(100)
             self._set_done_flag()
             self.tracker.mark_phase_done(self.title, skipped=skipped)
+
+
+class BatchPhaseTracker:
+    """Progress tracker for multi-file batch processing.
+
+    Wraps per-file ``PhaseTracker`` instances with an overall file-level
+    progress bar so users see "File 2/5: malware.pcap" alongside the
+    per-phase detail.
+    """
+
+    def __init__(self, total_files: int, phases_per_file: int, container):
+        self.total_files = max(total_files, 1)
+        self.phases_per_file = max(phases_per_file, 1)
+        self.current_file = 0
+        self._container = container
+        with container:
+            st.markdown("#### Batch Progress")
+            self.file_bar = st.progress(0)
+            self.file_text = st.empty()
+            st.markdown("---")
+
+    def start_file(self, filename: str) -> PhaseTracker:
+        """Begin tracking a new file and return a PhaseTracker for its stages."""
+        self.current_file += 1
+        pct = int((self.current_file - 1) / self.total_files * 100)
+        self.file_bar.progress(pct)
+        self.file_text.write(
+            f"File {self.current_file}/{self.total_files}: **{pathlib.Path(filename).name}**"
+        )
+        return PhaseTracker(self.phases_per_file, progress_container=self._container)
+
+    def finish_file(self):
+        """Mark the current file as fully processed."""
+        pct = int(self.current_file / self.total_files * 100)
+        self.file_bar.progress(pct)
+
+    def finish_all(self, msg: str = "Batch complete."):
+        """Mark all files as done."""
+        self.file_bar.progress(100)
+        self.file_text.write(msg)

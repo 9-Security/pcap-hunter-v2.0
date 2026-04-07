@@ -32,11 +32,11 @@ from app.pipeline.state import (
 )
 from app.pipeline.zeek import load_zeek_any, run_zeek
 from app.ui.charts import (
+    build_sankey_html,
     plot_attack_timeline,
     plot_flow_timeline,
     plot_network_graph,
     plot_protocol_distribution,
-    plot_sankey_flows,
     plot_top_n_charts,
     plot_world_map,
 )
@@ -1094,7 +1094,19 @@ with tab_dashboard:
 
     with st.container():
         st.markdown("---")
-        st.markdown("#### Top 10 Analysis")
+
+        # View mode toggle: IP-centric vs Domain-centric
+        top10_hdr_col, top10_toggle_col = st.columns([3, 1])
+        with top10_hdr_col:
+            st.markdown("#### Top 10 Analysis")
+        with top10_toggle_col:
+            top10_view = st.radio(
+                "View mode",
+                ["IP", "Domain"],
+                horizontal=True,
+                key="top10_view_mode",
+                label_visibility="collapsed",
+            )
 
         if filtered_flows:
             # Calculate Top 10s
@@ -1103,6 +1115,8 @@ with tab_dashboard:
             top_dst_ports = {}
             top_protos = {}
             top_domains = {}
+            top_src_domains = {}
+            top_dst_domains = {}
 
             # Use the global toggle from session state
             exclude_private = st.session_state.get("dashboard_exclude_private", False)
@@ -1129,11 +1143,31 @@ with tab_dashboard:
             if dns_data and isinstance(dns_data, dict):
                 for d in dns_data.get("top_queried", []):
                     top_domains[d.get("domain", "Unknown")] = d.get("count", 0)
-            elif "dns" in st.session_state.get("zeek_tables", {}):
-                dns_df = st.session_state["zeek_tables"]["dns"]
+            elif "dns.log" in st.session_state.get("zeek_tables", {}):
+                dns_df = st.session_state["zeek_tables"]["dns.log"]
                 if "query" in dns_df.columns:
-                    domain_counts = dns_df["query"].value_counts().head(10).to_dict()
+                    domain_counts = dns_df["query"].value_counts().head(20).to_dict()
                     top_domains.update(domain_counts)
+
+            # Build source/destination domain mappings from DNS responses
+            _zt = st.session_state.get("zeek_tables", {})
+            _dns_df = _zt.get("dns.log", pd.DataFrame())
+            if not _dns_df.empty and "query" in _dns_df.columns:
+                _orig_col = "id.orig_h" if "id.orig_h" in _dns_df.columns else "id_orig_h"
+                _resp_col = "id.resp_h" if "id.resp_h" in _dns_df.columns else "id_resp_h"
+                if _orig_col in _dns_df.columns:
+                    # Top queried domains by source IP (who is querying)
+                    _src_dom = _dns_df.groupby("query").size().sort_values(ascending=False).head(10).to_dict()
+                    top_src_domains = _src_dom
+                # Top resolved domains by answer count / query frequency
+                if "answers" in _dns_df.columns:
+                    _ans = _dns_df[_dns_df["answers"].notna() & (_dns_df["answers"] != "-")]
+                    if not _ans.empty:
+                        top_dst_domains = _ans["query"].value_counts().head(10).to_dict()
+                    else:
+                        top_dst_domains = dict(list(top_domains.items())[:10])
+                else:
+                    top_dst_domains = dict(list(top_domains.items())[:10])
 
             # rDNS map for hostname display
             rdns = st.session_state.get("rdns_map", {})
@@ -1141,35 +1175,101 @@ with tab_dashboard:
             # Render Top 10s in columns
             tcol1, tcol2 = st.columns(2)
 
-            with tcol1:
-                st.plotly_chart(plot_top_n_charts(top_src_ips, "Top 10 Source IPs"), width="stretch")
-                with st.expander("Source IP Table"):
-                    df_src = pd.DataFrame(list(top_src_ips.items()), columns=["IP", "Count"])
-                    df_src["Hostname"] = df_src["IP"].map(lambda ip: rdns.get(ip, ""))
-                    st.dataframe(df_src.sort_values("Count", ascending=False).head(10), hide_index=True)
+            if top10_view == "IP":
+                # --- IP-centric view ---
+                with tcol1:
+                    st.plotly_chart(
+                        plot_top_n_charts(top_src_ips, "Top 10 Source IPs"), width="stretch"
+                    )
+                    with st.expander("Source IP Table"):
+                        df_src = pd.DataFrame(list(top_src_ips.items()), columns=["IP", "Count"])
+                        df_src["Hostname"] = df_src["IP"].map(lambda ip: rdns.get(ip, ""))
+                        st.dataframe(
+                            df_src.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
 
-                st.plotly_chart(plot_top_n_charts(top_dst_ports, "Top 10 Destination Ports"), width="stretch")
-                with st.expander("Destination Port Table"):
-                    df_ports = pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"])
-                    st.dataframe(df_ports.sort_values("Count", ascending=False).head(10), hide_index=True)
+                    st.plotly_chart(
+                        plot_top_n_charts(top_dst_ports, "Top 10 Destination Ports"), width="stretch"
+                    )
+                    with st.expander("Destination Port Table"):
+                        df_ports = pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"])
+                        st.dataframe(
+                            df_ports.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
 
-            with tcol2:
-                st.plotly_chart(plot_top_n_charts(top_dst_ips, "Top 10 Destination IPs"), width="stretch")
-                with st.expander("Destination IP Table"):
-                    df_dst = pd.DataFrame(list(top_dst_ips.items()), columns=["IP", "Count"])
-                    df_dst["Hostname"] = df_dst["IP"].map(lambda ip: rdns.get(ip, ""))
-                    st.dataframe(df_dst.sort_values("Count", ascending=False).head(10), hide_index=True)
+                with tcol2:
+                    st.plotly_chart(
+                        plot_top_n_charts(top_dst_ips, "Top 10 Destination IPs"), width="stretch"
+                    )
+                    with st.expander("Destination IP Table"):
+                        df_dst = pd.DataFrame(list(top_dst_ips.items()), columns=["IP", "Count"])
+                        df_dst["Hostname"] = df_dst["IP"].map(lambda ip: rdns.get(ip, ""))
+                        st.dataframe(
+                            df_dst.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
 
-                if top_domains:
-                    st.plotly_chart(plot_top_n_charts(top_domains, "Top 10 Domains"), width="stretch")
-                    with st.expander("Domain Table"):
-                        df_dom = pd.DataFrame(list(top_domains.items()), columns=["Domain", "Count"])
-                        st.dataframe(df_dom.sort_values("Count", ascending=False).head(10), hide_index=True)
-                else:
-                    st.plotly_chart(plot_top_n_charts(top_protos, "Top 10 Protocols"), width="stretch")
+                    st.plotly_chart(
+                        plot_top_n_charts(top_protos, "Top 10 Protocols"), width="stretch"
+                    )
                     with st.expander("Protocol Table"):
                         df_proto = pd.DataFrame(list(top_protos.items()), columns=["Protocol", "Count"])
-                        st.dataframe(df_proto.sort_values("Count", ascending=False).head(10), hide_index=True)
+                        st.dataframe(
+                            df_proto.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
+
+            else:
+                # --- Domain-centric view ---
+                with tcol1:
+                    if top_src_domains:
+                        st.plotly_chart(
+                            plot_top_n_charts(top_src_domains, "Top 10 Queried Domains"),
+                            width="stretch",
+                        )
+                        with st.expander("Queried Domain Table"):
+                            df_qdom = pd.DataFrame(
+                                list(top_src_domains.items()), columns=["Domain", "Queries"]
+                            )
+                            st.dataframe(
+                                df_qdom.sort_values("Queries", ascending=False).head(10),
+                                hide_index=True,
+                            )
+                    else:
+                        st.info("No DNS query data available.")
+
+                    st.plotly_chart(
+                        plot_top_n_charts(top_dst_ports, "Top 10 Destination Ports"), width="stretch"
+                    )
+                    with st.expander("Destination Port Table"):
+                        df_ports = pd.DataFrame(list(top_dst_ports.items()), columns=["Port", "Count"])
+                        st.dataframe(
+                            df_ports.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
+
+                with tcol2:
+                    if top_dst_domains:
+                        st.plotly_chart(
+                            plot_top_n_charts(top_dst_domains, "Top 10 Resolved Domains"),
+                            width="stretch",
+                        )
+                        with st.expander("Resolved Domain Table"):
+                            df_rdom = pd.DataFrame(
+                                list(top_dst_domains.items()), columns=["Domain", "Responses"]
+                            )
+                            st.dataframe(
+                                df_rdom.sort_values("Responses", ascending=False).head(10),
+                                hide_index=True,
+                            )
+                    else:
+                        st.info("No DNS response data available.")
+
+                    st.plotly_chart(
+                        plot_top_n_charts(top_protos, "Top 10 Protocols"), width="stretch"
+                    )
+                    with st.expander("Protocol Table"):
+                        df_proto = pd.DataFrame(list(top_protos.items()), columns=["Protocol", "Count"])
+                        st.dataframe(
+                            df_proto.sort_values("Count", ascending=False).head(10), hide_index=True
+                        )
 
         else:
             st.info("Start analysis to see Top 10 metrics.")
@@ -1181,12 +1281,18 @@ with tab_dashboard:
     # Sankey + Network graph side by side
     dash_col1, dash_col2 = st.columns(2)
     with dash_col1:
-        # Sankey flow diagram
+        # Sankey flow diagram (ECharts via HTML — draggable nodes, zoom & pan)
         if filtered_flows:
-            sankey_fig = plot_sankey_flows(filtered_flows)
-            if sankey_fig.data:
-                st.plotly_chart(sankey_fig, use_container_width=True)
-                render_chart_hint("Source IP → Port (Protocol) → Destination IP. Width = packet volume.")
+            import streamlit.components.v1 as components
+
+            sankey_result = build_sankey_html(filtered_flows)
+            if sankey_result:
+                sankey_html, sankey_h = sankey_result
+                components.html(sankey_html, height=sankey_h + 20, scrolling=True)
+                render_chart_hint(
+                    "Drag nodes to rearrange. "
+                    "Source IP → Port (Protocol) → Destination IP. Width = packet volume."
+                )
 
     with dash_col2:
         # Network graph

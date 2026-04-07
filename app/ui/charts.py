@@ -567,20 +567,27 @@ def _port_label(dport: str, proto: str) -> str:
     return f"{dport}/{proto.upper()}"
 
 
-def plot_sankey_flows(
+def build_sankey_html(
     flows: List[Dict[str, Any]],
     max_services: int = 10,
     max_clients: int = 8,
     max_servers: int = 12,
-) -> go.Figure:
-    """Plot a Sankey diagram: Client IP → Service Port → Server IP.
+) -> tuple[str, int] | None:
+    """Build an HTML string rendering an ECharts Sankey diagram.
+
+    Returns a tuple of (html_string, chart_height_px) or None if no data.
+    The HTML uses the ECharts CDN and is rendered via st.components.v1.html.
+    Supports draggable nodes, mouse-wheel zoom, click-drag pan, and a
+    toolbar with save-as-image and reset buttons.
 
     Each flow is normalised so the side with the well-known port
     (< 10000) is treated as the server.  Flows where neither port is
-    well-known are assigned to the lower port side.
+    well-known are skipped (ephemeral-to-ephemeral).
     """
+    import json
+
     if not flows:
-        return go.Figure()
+        return None
 
     # --- Step 1: normalise every flow and aggregate ---
     agg: Dict[tuple, int] = defaultdict(int)
@@ -603,31 +610,26 @@ def plot_sankey_flows(
         proto = (f.get("proto") or "unknown")
         count = f.get("count", 1)
 
-        # Determine which side is the server (well-known port)
         sp_wk = 0 < sp < 10000
         dp_wk = 0 < dp < 10000
 
         if dp_wk and not sp_wk:
-            # dst has the service port → dst is server
             client, server, svc_port = src, dst, dp
         elif sp_wk and not dp_wk:
-            # src has the service port → src is server, flip
             client, server, svc_port = dst, src, sp
         elif dp_wk and sp_wk:
-            # Both well-known — use the lower port as service
             if dp <= sp:
                 client, server, svc_port = src, dst, dp
             else:
                 client, server, svc_port = dst, src, sp
         else:
-            # Neither well-known — skip (ephemeral-to-ephemeral)
             continue
 
         service = _port_label(str(svc_port), proto)
         agg[(client, service, server)] += count
 
     if not agg:
-        return go.Figure()
+        return None
 
     # --- Step 2: rank and pick top nodes ---
     cli_totals: Dict[str, int] = defaultdict(int)
@@ -645,76 +647,118 @@ def plot_sankey_flows(
     cli_set, svc_set, srv_set = set(top_cli), set(top_svc), set(top_srv)
     filtered = {k: v for k, v in agg.items() if k[0] in cli_set and k[1] in svc_set and k[2] in srv_set}
     if not filtered:
-        return go.Figure()
+        return None
 
-    # --- Step 3: build node arrays with namespace prefixes ---
-    # Prefixes prevent Plotly from merging an IP that appears as both
-    # client and server into a single node.
-    all_keys: list[str] = []
-    labels: list[str] = []
-    colors: list[str] = []
-    x_pos: list[float] = []
-    y_pos: list[float] = []
+    # --- Step 3: build ECharts nodes ---
+    nodes: list[dict] = []
+    for item in top_cli:
+        nodes.append({"name": f"C_{item}", "depth": 0, "itemStyle": {"color": "#4A90E2"}})
+    for item in top_svc:
+        nodes.append({"name": f"S_{item}", "depth": 1, "itemStyle": {"color": "#FFA94D"}})
+    for item in top_srv:
+        nodes.append({"name": f"D_{item}", "depth": 2, "itemStyle": {"color": "#51CF66"}})
 
-    def _add_column(items: list[str], prefix: str, x: float, color: str):
-        n = len(items)
-        for i, item in enumerate(items):
-            all_keys.append(f"{prefix}_{item}")
-            labels.append(item)
-            colors.append(color)
-            x_pos.append(x)
-            y_pos.append(0.02 + (i / max(n - 1, 1)) * 0.96 if n > 1 else 0.5)
-
-    _add_column(top_cli, "C", 0.01, "rgba(74, 144, 226, 0.85)")
-    _add_column(top_svc, "S", 0.48, "rgba(255, 169, 77, 0.85)")
-    _add_column(top_srv, "D", 0.99, "rgba(81, 207, 102, 0.85)")
-
-    key_idx = {k: i for i, k in enumerate(all_keys)}
-
-    # --- Step 4: build links (client→service, service→server) ---
-    hop1: Dict[tuple, int] = defaultdict(int)
-    hop2: Dict[tuple, int] = defaultdict(int)
+    # --- Step 4: build links ---
+    links: list[dict] = []
     for (cli, svc, srv), cnt in filtered.items():
-        hop1[(f"C_{cli}", f"S_{svc}")] += cnt
-        hop2[(f"S_{svc}", f"D_{srv}")] += cnt
+        links.append({"source": f"C_{cli}", "target": f"S_{svc}", "value": cnt})
+        links.append({"source": f"S_{svc}", "target": f"D_{srv}", "value": cnt})
 
-    link_src, link_tgt, link_val, link_clr = [], [], [], []
-    for (a, b), cnt in hop1.items():
-        link_src.append(key_idx[a])
-        link_tgt.append(key_idx[b])
-        link_val.append(cnt)
-        link_clr.append("rgba(74, 144, 226, 0.25)")
-    for (a, b), cnt in hop2.items():
-        link_src.append(key_idx[a])
-        link_tgt.append(key_idx[b])
-        link_val.append(cnt)
-        link_clr.append("rgba(81, 207, 102, 0.25)")
+    # --- Step 5: compute height ---
+    max_nodes = max(len(top_cli), len(top_svc), len(top_srv))
+    node_gap = max(8, min(30, 300 // max(max_nodes, 1)))
+    chart_height = max(500, min(1200, max_nodes * 55 + 120))
 
-    fig = go.Figure(data=[go.Sankey(
-        arrangement="fixed",
-        node=dict(
-            pad=18,
-            thickness=18,
-            line=dict(color="rgba(255,255,255,0.2)", width=0.5),
-            label=labels,
-            color=colors,
-            x=x_pos,
-            y=y_pos,
-        ),
-        link=dict(
-            source=link_src,
-            target=link_tgt,
-            value=link_val,
-            color=link_clr,
-        ),
-    )])
+    nodes_json = json.dumps(nodes)
+    links_json = json.dumps(links)
 
-    fig.update_layout(
-        title="Traffic Flow (Client → Service → Server)",
-        template="plotly_dark",
-        height=600,
-        margin=dict(l=10, r=10, t=50, b=20),
-        font=dict(size=10, color="#CCC"),
-    )
-    return fig
+    # --- Step 6: build self-contained HTML ---
+    html = f"""
+    <div id="sankey" style="width:100%;height:{chart_height}px;"></div>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <script>
+    var chart = echarts.init(document.getElementById('sankey'), 'dark');
+    var option = {{
+        backgroundColor: 'transparent',
+        title: {{
+            text: 'Traffic Flow (Client \\u2192 Service \\u2192 Server)',
+            left: 'left',
+            textStyle: {{ color: '#CCC', fontSize: 14 }}
+        }},
+        tooltip: {{
+            trigger: 'item',
+            triggerOn: 'mousemove',
+            backgroundColor: 'rgba(30,30,30,0.9)',
+            borderColor: '#555',
+            textStyle: {{ color: '#EEE' }},
+            formatter: function(params) {{
+                if (params.dataType === 'node') {{
+                    return params.name.replace(/^[CSD]_/, '');
+                }}
+                var src = params.data.source.replace(/^[CSD]_/, '');
+                var tgt = params.data.target.replace(/^[CSD]_/, '');
+                return src + ' \\u2192 ' + tgt + '<br/>Packets: ' + params.data.value;
+            }}
+        }},
+        toolbox: {{
+            show: true,
+            right: 10,
+            top: 0,
+            feature: {{
+                saveAsImage: {{ title: 'Save', pixelRatio: 2 }},
+                restore: {{ title: 'Reset' }}
+            }},
+            iconStyle: {{ borderColor: '#999' }}
+        }},
+        series: [{{
+            type: 'sankey',
+            draggable: true,
+            emphasis: {{ focus: 'adjacency' }},
+            nodeAlign: 'justify',
+            nodeGap: {node_gap},
+            nodeWidth: 18,
+            layoutIterations: 32,
+            orient: 'horizontal',
+            left: '8%',
+            right: '8%',
+            top: '8%',
+            bottom: '5%',
+            data: {nodes_json},
+            links: {links_json},
+            lineStyle: {{ color: 'gradient', curveness: 0.5, opacity: 0.3 }},
+            label: {{
+                position: 'right',
+                fontSize: 10,
+                color: '#CCC',
+                formatter: function(params) {{
+                    return params.name.replace(/^[CSD]_/, '');
+                }}
+            }},
+            levels: [
+                {{
+                    depth: 0,
+                    label: {{ position: 'left' }},
+                    itemStyle: {{ color: '#4A90E2' }},
+                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                }},
+                {{
+                    depth: 1,
+                    label: {{ position: 'right' }},
+                    itemStyle: {{ color: '#FFA94D' }},
+                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                }},
+                {{
+                    depth: 2,
+                    label: {{ position: 'right' }},
+                    itemStyle: {{ color: '#51CF66' }},
+                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                }}
+            ]
+        }}]
+    }};
+    chart.setOption(option);
+    window.addEventListener('resize', function() {{ chart.resize(); }});
+    </script>
+    """
+    return html, chart_height
 

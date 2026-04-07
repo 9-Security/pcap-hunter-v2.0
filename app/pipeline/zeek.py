@@ -12,7 +12,7 @@ from app.utils.logger import log_runtime_error
 
 
 def run_zeek(pcap_path: str, out_dir: str, phase: PhaseHandle | None = None) -> dict[str, str]:
-    ensure_dir(out_dir)
+    ensure_dir(pathlib.Path(out_dir))
     zeek_bin = find_bin("zeek", env_key="ZEEK_BIN", cfg_key="cfg_zeek_bin")
     if not zeek_bin:
         msg = "Zeek binary not found. Please install Zeek or set ZEEK_BIN env var."
@@ -23,8 +23,11 @@ def run_zeek(pcap_path: str, out_dir: str, phase: PhaseHandle | None = None) -> 
         phase.done("Zeek skipped.")
         return {}
 
-    cmd_json = [zeek_bin, "-C", "-r", pcap_path, "policy/tuning/json-logs.zeek"]
-    cmd_ascii = [zeek_bin, "-C", "-r", pcap_path]
+    # Resolve to absolute path since subprocess runs with cwd=out_dir
+    abs_pcap = str(pathlib.Path(pcap_path).resolve())
+
+    cmd_json = [zeek_bin, "-C", "-r", abs_pcap, "policy/tuning/json-logs.zeek"]
+    cmd_ascii = [zeek_bin, "-C", "-r", abs_pcap]
 
     if phase:
         phase.set(5, "Launching Zeek (JSON logs)…")

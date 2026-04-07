@@ -1462,7 +1462,13 @@ with tab_llm:
 # 5) OSINT ----------------------
 with tab_osint:
     st.markdown("### OSINT Investigation")
-    render_osint(st.container(), st.session_state.get("osint") or {"ips": {}, "domains": {}, "ja3": {}})
+    render_osint(
+        st.container(),
+        st.session_state.get("osint") or {"ips": {}, "domains": {}, "ja3": {}},
+        correlations=st.session_state.get("correlations"),
+        features=st.session_state.get("features"),
+        beacon_df=st.session_state.get("beacon_df"),
+    )
 
 # 5) Raw Data ----------------------
 with tab_results:

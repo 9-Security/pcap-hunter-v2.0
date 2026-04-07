@@ -677,20 +677,20 @@ def build_sankey_html(
     <div id="sankey" style="width:100%;height:{chart_height}px;"></div>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script>
-    var chart = echarts.init(document.getElementById('sankey'), 'dark');
+    var chart = echarts.init(document.getElementById('sankey'));
     var option = {{
         backgroundColor: 'transparent',
         title: {{
             text: 'Traffic Flow (Client \\u2192 Service \\u2192 Server)',
             left: 'left',
-            textStyle: {{ color: '#CCC', fontSize: 14 }}
+            textStyle: {{ color: '#222', fontSize: 14, fontWeight: 'bold' }}
         }},
         tooltip: {{
             trigger: 'item',
             triggerOn: 'mousemove',
-            backgroundColor: 'rgba(30,30,30,0.9)',
-            borderColor: '#555',
-            textStyle: {{ color: '#EEE' }},
+            backgroundColor: 'rgba(255,255,255,0.95)',
+            borderColor: '#999',
+            textStyle: {{ color: '#333' }},
             formatter: function(params) {{
                 if (params.dataType === 'node') {{
                     return params.name.replace(/^[CSD]_/, '');
@@ -708,7 +708,7 @@ def build_sankey_html(
                 saveAsImage: {{ title: 'Save', pixelRatio: 2 }},
                 restore: {{ title: 'Reset' }}
             }},
-            iconStyle: {{ borderColor: '#999' }}
+            iconStyle: {{ borderColor: '#666' }}
         }},
         series: [{{
             type: 'sankey',
@@ -725,11 +725,12 @@ def build_sankey_html(
             bottom: '5%',
             data: {nodes_json},
             links: {links_json},
-            lineStyle: {{ color: 'gradient', curveness: 0.5, opacity: 0.3 }},
+            lineStyle: {{ color: 'gradient', curveness: 0.5, opacity: 0.35 }},
             label: {{
                 position: 'right',
-                fontSize: 10,
-                color: '#CCC',
+                fontSize: 11,
+                color: '#333',
+                fontWeight: 'bold',
                 formatter: function(params) {{
                     return params.name.replace(/^[CSD]_/, '');
                 }}
@@ -739,19 +740,19 @@ def build_sankey_html(
                     depth: 0,
                     label: {{ position: 'left' }},
                     itemStyle: {{ color: '#4A90E2' }},
-                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                    lineStyle: {{ color: 'source', opacity: 0.3 }}
                 }},
                 {{
                     depth: 1,
                     label: {{ position: 'right' }},
                     itemStyle: {{ color: '#FFA94D' }},
-                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                    lineStyle: {{ color: 'source', opacity: 0.3 }}
                 }},
                 {{
                     depth: 2,
                     label: {{ position: 'right' }},
                     itemStyle: {{ color: '#51CF66' }},
-                    lineStyle: {{ color: 'source', opacity: 0.25 }}
+                    lineStyle: {{ color: 'source', opacity: 0.3 }}
                 }}
             ]
         }}]

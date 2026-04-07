@@ -350,7 +350,661 @@ def show_whois_dialog(target: str):
         st.json(info)
 
 
-def render_osint(result_col, osint_data):
+def _verdict_badge(verdict: str) -> str:
+    """Return a colored HTML badge for an IOC verdict."""
+    colors = {
+        "critical": ("#ff6b6b", "#fff"),
+        "high": ("#ffa94d", "#fff"),
+        "medium": ("#ffd43b", "#333"),
+        "low": ("#51cf66", "#fff"),
+        "clean": ("#4dabf7", "#fff"),
+        "unknown": ("#adb5bd", "#fff"),
+    }
+    bg, fg = colors.get(verdict.lower(), colors["unknown"])
+    return (
+        f'<span style="display:inline-block;padding:2px 10px;border-radius:12px;'
+        f'background:{bg};color:{fg};font-weight:600;font-size:0.8rem;'
+        f'text-transform:uppercase;">{verdict}</span>'
+    )
+
+
+def _provider_pill(name: str, status: str) -> str:
+    """Return a small pill showing provider status."""
+    if status == "ok":
+        bg, icon = "rgba(81,207,102,0.18)", "✅"
+    elif status == "error":
+        bg, icon = "rgba(255,107,107,0.18)", "❌"
+    elif status == "cached":
+        bg, icon = "rgba(77,171,247,0.18)", "💾"
+    else:  # not configured
+        bg, icon = "rgba(173,181,189,0.18)", "⚪"
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;margin:2px;'
+        f'border-radius:10px;background:{bg};font-size:0.75rem;">'
+        f'{icon} {name}</span>'
+    )
+
+
+def _extract_vt_ip_stats(obj: dict) -> dict:
+    """Extract VT detection stats from raw IP OSINT data."""
+    vt = obj.get("vt") or {}
+    attr = vt.get("data", {}).get("attributes", {})
+    stats = attr.get("last_analysis_stats", {})
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    total = sum(stats.values()) if stats else 0
+    return {
+        "reputation": attr.get("reputation", "n/a"),
+        "malicious": malicious,
+        "suspicious": suspicious,
+        "total": total,
+        "detections": f"{malicious}/{total}" if total > 0 else "n/a",
+        "asn": attr.get("asn", ""),
+        "as_owner": attr.get("as_owner", ""),
+        "network": attr.get("network", ""),
+        "last_analysis_date": attr.get("last_analysis_date", ""),
+        "community_score": attr.get("reputation", 0),
+    }
+
+
+def _extract_abuseipdb_stats(obj: dict) -> dict:
+    """Extract AbuseIPDB stats from raw OSINT data."""
+    abuse = obj.get("abuseipdb") or {}
+    data = abuse.get("data", abuse)  # AbuseIPDB wraps in 'data'
+    return {
+        "score": data.get("abuseConfidenceScore", data.get("score", "n/a")),
+        "total_reports": data.get("totalReports", data.get("totalReports", 0)),
+        "isp": data.get("isp", ""),
+        "usage_type": data.get("usageType", ""),
+        "domain": data.get("domain", ""),
+        "is_tor": data.get("isTor", False),
+        "is_whitelisted": data.get("isWhitelisted", False),
+        "last_reported": data.get("lastReportedAt", ""),
+    }
+
+
+def _extract_shodan_stats(obj: dict) -> dict:
+    """Extract Shodan stats from raw OSINT data."""
+    shodan = obj.get("shodan") or {}
+    ports = shodan.get("ports", [])
+    vulns = shodan.get("vulns", [])
+    hostnames = shodan.get("hostnames", [])
+    os_info = shodan.get("os", "")
+    org = shodan.get("org", "")
+    return {
+        "ports": ports[:20] if isinstance(ports, list) else [],
+        "vulns": vulns[:10] if isinstance(vulns, list) else [],
+        "hostnames": hostnames[:5] if isinstance(hostnames, list) else [],
+        "os": os_info or "",
+        "org": org or "",
+        "isp": shodan.get("isp", ""),
+        "last_update": shodan.get("last_update", ""),
+        "country": shodan.get("country_name", ""),
+        "city": shodan.get("city", ""),
+    }
+
+
+def _extract_greynoise_stats(obj: dict) -> dict:
+    """Extract GreyNoise stats from raw OSINT data."""
+    gn = obj.get("greynoise") or {}
+    return {
+        "classification": gn.get("classification", "n/a"),
+        "name": gn.get("name", ""),
+        "noise": gn.get("noise", False),
+        "riot": gn.get("riot", False),
+        "link": gn.get("link", ""),
+    }
+
+
+def _determine_ip_verdict(vt_stats: dict, abuse_stats: dict, gn_stats: dict, shodan_stats: dict) -> str:
+    """Determine overall verdict for an IP based on all provider data."""
+    vt_malicious = vt_stats.get("malicious", 0)
+    abuse_score = abuse_stats.get("score", 0)
+    if isinstance(abuse_score, str):
+        abuse_score = 0
+    gn_class = gn_stats.get("classification", "unknown")
+    vulns = shodan_stats.get("vulns", [])
+
+    if vt_malicious >= 5 or abuse_score >= 80 or gn_class == "malicious":
+        return "critical"
+    elif vt_malicious >= 2 or abuse_score >= 50 or len(vulns) >= 3:
+        return "high"
+    elif vt_malicious >= 1 or abuse_score >= 20 or gn_class == "unknown":
+        return "medium"
+    elif gn_class == "benign" and abuse_score == 0 and vt_malicious == 0:
+        return "clean"
+    return "low"
+
+
+def _determine_domain_verdict(obj: dict) -> str:
+    """Determine overall verdict for a domain."""
+    vt = obj.get("vt") or {}
+    attr = vt.get("data", {}).get("attributes", {})
+    stats = attr.get("last_analysis_stats", {})
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+
+    otx = obj.get("otx") or {}
+    pulse_count = len(otx.get("pulse_info", {}).get("pulses", [])) if isinstance(otx.get("pulse_info"), dict) else 0
+
+    if malicious >= 5 or pulse_count >= 10:
+        return "critical"
+    elif malicious >= 2 or pulse_count >= 5:
+        return "high"
+    elif malicious >= 1 or suspicious >= 2 or pulse_count >= 1:
+        return "medium"
+    elif malicious == 0 and suspicious == 0:
+        return "clean"
+    return "low"
+
+
+def _categorize_domain(domain: str, vt_attr: dict) -> str:
+    """Categorize a domain (CDN, Cloud, DGA, Hosting, etc.)."""
+    import math
+
+    cats = vt_attr.get("categories", {})
+    if isinstance(cats, dict):
+        for v in cats.values():
+            v_lower = str(v).lower()
+            if "cdn" in v_lower:
+                return "CDN"
+            if "cloud" in v_lower:
+                return "Cloud"
+            if "malware" in v_lower or "phishing" in v_lower:
+                return "Malicious"
+            if "parking" in v_lower or "parked" in v_lower:
+                return "Parked"
+
+    # Simple DGA heuristic — high consonant ratio + high entropy
+    if domain and "." in domain:
+        label = domain.split(".")[0]
+        if len(label) > 8:
+            consonants = sum(1 for c in label.lower() if c.isalpha() and c not in "aeiou")
+            ratio = consonants / max(len(label), 1)
+            # Shannon entropy
+            freq = {}
+            for c in label:
+                freq[c] = freq.get(c, 0) + 1
+            entropy = -sum((cnt / len(label)) * math.log2(cnt / len(label)) for cnt in freq.values())
+            if entropy > 3.5 and ratio > 0.7:
+                return "DGA-suspect"
+
+    # Common CDN/Cloud patterns
+    cdn_patterns = ["cloudfront", "akamai", "fastly", "cloudflare", "cdn", "edgecast"]
+    cloud_patterns = ["amazonaws", "azure", "googleapis", "gcloud", "digitalocean"]
+    for pat in cdn_patterns:
+        if pat in domain.lower():
+            return "CDN"
+    for pat in cloud_patterns:
+        if pat in domain.lower():
+            return "Cloud"
+
+    return "General"
+
+
+def _render_ip_detail_card(ip: str, obj: dict, vt: dict, abuse: dict, gn: dict, shodan: dict):
+    """Render an expandable detail card for a single IP."""
+    verdict = _determine_ip_verdict(vt, abuse, gn, shodan)
+
+    with st.expander(f"🔍 {ip}  —  {_verdict_badge(verdict)}", expanded=False):
+        # Provider status pills
+        providers_html = ""
+        ip_providers_map = [
+            ("VT", "vt"), ("AbuseIPDB", "abuseipdb"),
+            ("GreyNoise", "greynoise"), ("Shodan", "shodan"),
+        ]
+        for name, data_key in ip_providers_map:
+            raw = obj.get(data_key)
+            if raw is None:
+                providers_html += _provider_pill(name, "none")
+            elif raw.get("_error"):
+                providers_html += _provider_pill(name, "error")
+            elif raw.get("_cached"):
+                providers_html += _provider_pill(name, "cached")
+            else:
+                providers_html += _provider_pill(name, "ok")
+        st.markdown(f"**Providers:** {providers_html}", unsafe_allow_html=True)
+
+        # Three-column layout for key data
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**VirusTotal**")
+            st.text(f"Detections: {vt.get('detections', 'n/a')}")
+            st.text(f"Reputation: {vt.get('reputation', 'n/a')}")
+            st.text(f"ASN: {vt.get('asn', 'n/a')} ({vt.get('as_owner', '')})")
+            st.text(f"Network: {vt.get('network', 'n/a')}")
+
+        with c2:
+            st.markdown("**AbuseIPDB**")
+            abuse_score_val = abuse.get("score", "n/a")
+            st.text(f"Confidence: {abuse_score_val}%")
+            st.text(f"Reports: {abuse.get('total_reports', 0)}")
+            st.text(f"ISP: {abuse.get('isp', 'n/a')}")
+            st.text(f"Usage: {abuse.get('usage_type', 'n/a')}")
+            if abuse.get("is_tor"):
+                st.warning("🧅 TOR Exit Node")
+
+        with c3:
+            st.markdown("**GreyNoise**")
+            gn_class = gn.get("classification", "n/a")
+            gn_color = {"malicious": "🔴", "benign": "🟢", "unknown": "🟡"}.get(gn_class, "⚪")
+            st.text(f"Classification: {gn_color} {gn_class}")
+            st.text(f"Name: {gn.get('name', 'n/a')}")
+            if gn.get("riot"):
+                st.info("ℹ️ Known benign service (RIOT)")
+
+        # Shodan section
+        if shodan.get("ports") or shodan.get("vulns") or shodan.get("os"):
+            st.markdown("---")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown("**Shodan**")
+                if shodan.get("ports"):
+                    st.text(f"Open Ports: {', '.join(str(p) for p in shodan['ports'])}")
+                if shodan.get("os"):
+                    st.text(f"OS: {shodan['os']}")
+                if shodan.get("org"):
+                    st.text(f"Org: {shodan['org']}")
+                if shodan.get("hostnames"):
+                    st.text(f"Hostnames: {', '.join(shodan['hostnames'])}")
+            with sc2:
+                if shodan.get("vulns"):
+                    st.markdown("**Known Vulnerabilities**")
+                    for cve in shodan["vulns"][:10]:
+                        st.error(f"⚠️ {cve}")
+
+        # GeoIP + PTR
+        st.markdown("---")
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            st.text(f"Country: {obj.get('country', 'n/a')}")
+            st.text(f"City: {obj.get('city', 'n/a')}")
+        with gc2:
+            st.text(f"PTR: {obj.get('ptr', 'n/a')}")
+            if abuse.get("last_reported"):
+                st.text(f"Last Reported: {abuse['last_reported']}")
+
+    return verdict
+
+
+def _render_provider_status_bar(osint_data: dict):
+    """Render provider configuration and response status indicators."""
+    ips_data = osint_data.get("ips") or {}
+    if not ips_data:
+        return
+
+    # Sample first IP to determine provider status
+    sample = next(iter(ips_data.values()), {})
+    providers = {
+        "VirusTotal": "vt",
+        "AbuseIPDB": "abuseipdb",
+        "GreyNoise": "greynoise",
+        "Shodan": "shodan",
+    }
+
+    pills = []
+    for name, key in providers.items():
+        raw = sample.get(key)
+        if raw is None:
+            pills.append(_provider_pill(name, "none"))
+        elif raw.get("_error"):
+            pills.append(_provider_pill(name, "error"))
+        elif raw.get("_cached"):
+            pills.append(_provider_pill(name, "cached"))
+        else:
+            pills.append(_provider_pill(name, "ok"))
+
+    # Domain providers
+    doms_data = osint_data.get("domains") or {}
+    if doms_data:
+        sample_dom = next(iter(doms_data.values()), {})
+        for name, key in [("VT (Domain)", "vt"), ("OTX", "otx")]:
+            raw = sample_dom.get(key)
+            if raw is None:
+                pills.append(_provider_pill(name, "none"))
+            elif raw.get("_error"):
+                pills.append(_provider_pill(name, "error"))
+            elif raw.get("_cached"):
+                pills.append(_provider_pill(name, "cached"))
+            else:
+                pills.append(_provider_pill(name, "ok"))
+
+    st.markdown("**Provider Status:** " + " ".join(pills), unsafe_allow_html=True)
+
+
+def _render_osint_coverage_heatmap(osint_data: dict):
+    """Render a coverage heatmap showing which IOCs have full/partial/no OSINT data."""
+    ips_data = osint_data.get("ips") or {}
+    doms_data = osint_data.get("domains") or {}
+    if not ips_data and not doms_data:
+        return
+
+    full = partial = none_count = 0
+    ip_providers = ["vt", "abuseipdb", "greynoise", "shodan"]
+    for obj in ips_data.values():
+        has = sum(1 for p in ip_providers if obj.get(p) and not obj.get(p, {}).get("_error"))
+        if has == len(ip_providers):
+            full += 1
+        elif has > 0:
+            partial += 1
+        else:
+            none_count += 1
+
+    dom_providers = ["vt", "otx"]
+    for obj in doms_data.values():
+        has = sum(1 for p in dom_providers if obj.get(p) and not obj.get(p, {}).get("_error"))
+        if has == len(dom_providers):
+            full += 1
+        elif has > 0:
+            partial += 1
+        else:
+            none_count += 1
+
+    total = full + partial + none_count
+    if total == 0:
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total IOCs", total)
+    with c2:
+        st.metric("Full Coverage", full, help="All configured providers returned data")
+    with c3:
+        st.metric("Partial", partial, help="Some providers returned data")
+    with c4:
+        st.metric("No Data", none_count, help="No provider data available")
+
+    # Simple bar
+    if total > 0:
+        pct_full = full / total * 100
+        pct_partial = partial / total * 100
+        pct_none = none_count / total * 100
+        st.markdown(
+            f'<div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:1rem;">'
+            f'<div style="width:{pct_full}%;background:#51cf66;"></div>'
+            f'<div style="width:{pct_partial}%;background:#ffd43b;"></div>'
+            f'<div style="width:{pct_none}%;background:#adb5bd;"></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _render_asn_grouping(osint_data: dict):
+    """Render IPs grouped by ASN/Organization."""
+    ips_data = osint_data.get("ips") or {}
+    if not ips_data:
+        return
+
+    asn_groups: dict[str, list] = {}
+    for ip, obj in ips_data.items():
+        vt_attr = (obj.get("vt") or {}).get("data", {}).get("attributes", {})
+        shodan = obj.get("shodan") or {}
+        asn = vt_attr.get("as_owner") or shodan.get("org") or "Unknown"
+        asn_num = vt_attr.get("asn", "")
+        key = f"AS{asn_num} — {asn}" if asn_num else asn
+        if key not in asn_groups:
+            asn_groups[key] = []
+        asn_groups[key].append(ip)
+
+    if not asn_groups:
+        return
+
+    # Sort by number of IPs (descending) to surface infrastructure patterns
+    sorted_groups = sorted(asn_groups.items(), key=lambda x: len(x[1]), reverse=True)
+
+    rows = []
+    for asn_label, ips in sorted_groups:
+        rows.append({
+            "ASN / Organization": asn_label,
+            "IP Count": len(ips),
+            "IPs": ", ".join(ips[:10]) + ("..." if len(ips) > 10 else ""),
+        })
+
+    if rows:
+        st.markdown("#### ASN / Organization Grouping")
+        st.caption("IPs grouped by autonomous system — spot shared infrastructure.")
+        df = pd.DataFrame(rows)
+        st.dataframe(df, width="stretch", hide_index=True)
+
+
+def _render_related_iocs(osint_data: dict):
+    """Render related IOC discovery — IPs in same /24 subnet, domains on same IP."""
+    ips_data = osint_data.get("ips") or {}
+    if len(ips_data) < 2:
+        return
+
+    # Group by /24 subnet
+    subnet_groups: dict[str, list] = {}
+    for ip in ips_data:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            subnet = ".".join(parts[:3]) + ".0/24"
+            if subnet not in subnet_groups:
+                subnet_groups[subnet] = []
+            subnet_groups[subnet].append(ip)
+
+    # Only show subnets with multiple IPs
+    shared_subnets = {k: v for k, v in subnet_groups.items() if len(v) >= 2}
+    if not shared_subnets:
+        return
+
+    st.markdown("#### Related IOC Discovery")
+    st.caption("IPs sharing the same /24 subnet — may indicate shared infrastructure.")
+
+    rows = []
+    for subnet, ips in sorted(shared_subnets.items(), key=lambda x: len(x[1]), reverse=True):
+        rows.append({
+            "Subnet": subnet,
+            "Count": len(ips),
+            "IPs": ", ".join(ips),
+        })
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _render_ioc_export_panel(osint_data: dict):
+    """Render IOC export panel with multiple format options."""
+    import json as _json
+
+    ips_data = osint_data.get("ips") or {}
+    doms_data = osint_data.get("domains") or {}
+    if not ips_data and not doms_data:
+        return
+
+    st.markdown("#### IOC Export")
+    fmt = st.radio("Format", ["CSV", "JSON", "STIX 2.1", "Clipboard-ready"], horizontal=True, key="ioc_export_fmt")
+
+    all_iocs = []
+    for ip, obj in ips_data.items():
+        vt = _extract_vt_ip_stats(obj)
+        abuse = _extract_abuseipdb_stats(obj)
+        gn = _extract_greynoise_stats(obj)
+        verdict = _determine_ip_verdict(vt, abuse, gn, _extract_shodan_stats(obj))
+        all_iocs.append({
+            "type": "ip",
+            "value": ip,
+            "verdict": verdict,
+            "vt_detections": vt.get("detections", ""),
+            "abuse_score": abuse.get("score", ""),
+            "greynoise": gn.get("classification", ""),
+            "country": obj.get("country", ""),
+            "ptr": obj.get("ptr", ""),
+        })
+
+    for dom, obj in doms_data.items():
+        verdict = _determine_domain_verdict(obj)
+        vt_attr = (obj.get("vt") or {}).get("data", {}).get("attributes", {})
+        stats = vt_attr.get("last_analysis_stats", {})
+        all_iocs.append({
+            "type": "domain",
+            "value": dom,
+            "verdict": verdict,
+            "vt_detections": f"{stats.get('malicious', 0)}/{sum(stats.values()) if stats else 0}",
+        })
+
+    if fmt == "CSV":
+        csv_bytes = export_to_csv(all_iocs)
+        st.download_button("📥 Download CSV", csv_bytes, generate_export_filename("iocs", "csv"),
+                           "text/csv", key="ioc_dl_csv")
+    elif fmt == "JSON":
+        json_bytes = export_to_json(all_iocs)
+        st.download_button("📥 Download JSON", json_bytes, generate_export_filename("iocs", "json"),
+                           "application/json", key="ioc_dl_json")
+    elif fmt == "STIX 2.1":
+        stix_bundle = _build_stix_bundle(all_iocs)
+        stix_bytes = _json.dumps(stix_bundle, indent=2).encode("utf-8")
+        st.download_button("📥 Download STIX 2.1", stix_bytes, generate_export_filename("iocs", "stix.json"),
+                           "application/json", key="ioc_dl_stix")
+    elif fmt == "Clipboard-ready":
+        lines = [ioc["value"] for ioc in all_iocs]
+        st.code("\n".join(lines), language="text")
+
+
+def _build_stix_bundle(iocs: list[dict]) -> dict:
+    """Build a minimal STIX 2.1 bundle from IOCs."""
+    import datetime
+    import uuid
+
+    objects = []
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    for ioc in iocs:
+        ioc_type = ioc.get("type", "unknown")
+        value = ioc.get("value", "")
+
+        if ioc_type == "ip":
+            obj = {
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid4()}",
+                "created": now,
+                "modified": now,
+                "name": f"IP: {value}",
+                "pattern": f"[ipv4-addr:value = '{value}']",
+                "pattern_type": "stix",
+                "valid_from": now,
+                "labels": [f"verdict:{ioc.get('verdict', 'unknown')}"],
+            }
+        elif ioc_type == "domain":
+            obj = {
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid4()}",
+                "created": now,
+                "modified": now,
+                "name": f"Domain: {value}",
+                "pattern": f"[domain-name:value = '{value}']",
+                "pattern_type": "stix",
+                "valid_from": now,
+                "labels": [f"verdict:{ioc.get('verdict', 'unknown')}"],
+            }
+        else:
+            continue
+        objects.append(obj)
+
+    return {
+        "type": "bundle",
+        "id": f"bundle--{uuid.uuid4()}",
+        "objects": objects,
+    }
+
+
+def _render_geo_map(osint_data: dict):
+    """Render a world map of IP geolocations using Plotly scatter_geo."""
+    ips_data = osint_data.get("ips") or {}
+    if not ips_data:
+        return
+
+    # Build location data from GeoIP and Shodan
+    geo_rows = []
+    for ip, obj in ips_data.items():
+        country = obj.get("country", "")
+        city = obj.get("city", "")
+        if country:
+            vt = _extract_vt_ip_stats(obj)
+            abuse = _extract_abuseipdb_stats(obj)
+            gn = _extract_greynoise_stats(obj)
+            verdict = _determine_ip_verdict(vt, abuse, gn, _extract_shodan_stats(obj))
+            geo_rows.append({
+                "IP": ip,
+                "Country": country,
+                "City": city or "",
+                "Verdict": verdict,
+                "VT Detections": vt.get("detections", "n/a"),
+            })
+
+    if not geo_rows:
+        return
+
+    st.markdown("#### IP Geolocation Map")
+    df_geo = pd.DataFrame(geo_rows)
+    # Group by country for a choropleth count
+    country_counts = df_geo["Country"].value_counts().reset_index()
+    country_counts.columns = ["Country", "Count"]
+
+    try:
+        import plotly.express as px
+
+        fig = px.choropleth(
+            country_counts,
+            locations="Country",
+            locationmode="country names",
+            color="Count",
+            color_continuous_scale="Reds",
+            title="",
+            height=350,
+        )
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            geo=dict(showframe=False, showcoastlines=True, projection_type="natural earth"),
+            coloraxis_colorbar=dict(title="IPs"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except ImportError:
+        st.warning("Plotly required for geo map. Install with: pip install plotly")
+
+    # Detail table
+    st.dataframe(df_geo, width="stretch", hide_index=True)
+
+
+def _render_analyst_notes(osint_data: dict):
+    """Render per-IOC analyst notes with session-state persistence."""
+    key = "osint_analyst_notes"
+    if key not in st.session_state:
+        st.session_state[key] = {}
+
+    notes = st.session_state[key]
+
+    st.markdown("#### Analyst Notes")
+    st.caption("Add notes for any IOC. Notes are saved for this session.")
+
+    ips = list((osint_data.get("ips") or {}).keys())
+    doms = list((osint_data.get("domains") or {}).keys())
+    all_iocs = [f"IP: {ip}" for ip in ips] + [f"Domain: {d}" for d in doms]
+
+    if not all_iocs:
+        st.info("No IOCs available for notes.")
+        return
+
+    selected = st.selectbox("Select IOC", all_iocs, key="note_ioc_select")
+    current_note = notes.get(selected, "")
+    new_note = st.text_area("Note", value=current_note, key="note_text_area", height=100)
+    if st.button("💾 Save Note", key="save_note_btn"):
+        notes[selected] = new_note
+        st.session_state[key] = notes
+        st.success(f"Note saved for {selected}")
+
+    # Show all existing notes
+    if notes:
+        st.markdown("---")
+        st.markdown("**Saved Notes:**")
+        for ioc_label, note_text in notes.items():
+            if note_text.strip():
+                st.markdown(f"**{ioc_label}:** {note_text}")
+
+
+def render_osint(result_col, osint_data, *, correlations=None, features=None, beacon_df=None):
+    """Render comprehensive OSINT investigation panel with all enrichment data."""
     # Initialize selection state trackers
     if "last_ip_sel" not in st.session_state:
         st.session_state["last_ip_sel"] = []
@@ -358,72 +1012,204 @@ def render_osint(result_col, osint_data):
         st.session_state["last_dom_sel"] = []
 
     with result_col:
-        # Use tabs instead of columns for better space
-        tab_ips, tab_doms, tab_devices = st.tabs(["IP Addresses", "Domains", "Devices/MACs"])
+        # Provider status bar
+        _render_provider_status_bar(osint_data)
 
-        # IPs Tab
+        # Coverage heatmap
+        _render_osint_coverage_heatmap(osint_data)
+
+        st.markdown("---")
+
+        # Main tabs
+        tab_ips, tab_doms, tab_details, tab_geo, tab_infra, tab_export, tab_devices, tab_notes = st.tabs([
+            "🎯 IP Triage",
+            "🌐 Domains",
+            "🔍 Detail Cards",
+            "🗺️ Geo Map",
+            "🏗️ Infrastructure",
+            "📦 Export",
+            "💻 Devices",
+            "📝 Notes",
+        ])
+
+        # ==================== IP TRIAGE TAB ====================
         with tab_ips:
-            st.caption("Select a row to view WHOIS information.")
+            st.caption("Prioritized IP table — select a row for WHOIS lookup.")
             ip_rows = []
             for ip, obj in (osint_data.get("ips") or {}).items():
-                vt_attr = (obj.get("vt") or {}).get("data", {}).get("attributes", {})
-                vt_rep = vt_attr.get("reputation", "n/a")
-                gn = (obj.get("greynoise") or {}).get("classification", "n/a")
-                ptr = obj.get("ptr", "n/a")
-                city = obj.get("city", "n/a")
-                country = obj.get("country", "n/a")
+                vt = _extract_vt_ip_stats(obj)
+                abuse = _extract_abuseipdb_stats(obj)
+                gn = _extract_greynoise_stats(obj)
+                shodan = _extract_shodan_stats(obj)
+                verdict = _determine_ip_verdict(vt, abuse, gn, shodan)
+
+                # Check if IP appears in flow data (cross-reference)
+                in_flows = False
+                if features and isinstance(features, dict):
+                    flow_ips = features.get("artifacts", {}).get("ips", [])
+                    in_flows = ip in flow_ips
+
                 ip_rows.append({
+                    "Verdict": verdict.upper(),
                     "IP": ip,
-                    "Country": country,
-                    "City": city,
-                    "PTR": ptr,
-                    "GreyNoise": gn,
-                    "VT Rep": vt_rep
+                    "ASN/Org": f"{vt.get('as_owner', '') or shodan.get('org', '')}",
+                    "Country": obj.get("country", "n/a"),
+                    "AbuseIPDB": f"{abuse.get('score', 'n/a')}% ({abuse.get('total_reports', 0)} rpts)",
+                    "VT": vt.get("detections", "n/a"),
+                    "GreyNoise": gn.get("classification", "n/a"),
+                    "Shodan Ports": ", ".join(str(p) for p in shodan.get("ports", [])[:8]) or "n/a",
+                    "PTR": obj.get("ptr", "n/a"),
+                    "In Flows": "✅" if in_flows else "",
+                    "_sort_score": (
+                        {"critical": 4, "high": 3, "medium": 2, "low": 1, "clean": 0, "unknown": 0}
+                        .get(verdict, 0)
+                    ),
                 })
 
             if ip_rows:
+                # Sort by verdict severity
+                ip_rows.sort(key=lambda r: r["_sort_score"], reverse=True)
+                # Remove internal sort key
+                for r in ip_rows:
+                    del r["_sort_score"]
+
                 df_ips = pd.DataFrame(ip_rows)
-                render_export_buttons(df_ips, "osint_ips", key_suffix="ips", is_dataframe=True)
+
+                # Color-code verdict column using Streamlit column_config
+                render_export_buttons(df_ips, "osint_ips", key_suffix="ips_v2", is_dataframe=True)
+
+                # Apply row coloring via HTML
+                verdict_colors = {
+                    "CRITICAL": "background-color: rgba(255,107,107,0.15);",
+                    "HIGH": "background-color: rgba(255,169,77,0.15);",
+                    "MEDIUM": "background-color: rgba(255,212,59,0.10);",
+                    "LOW": "",
+                    "CLEAN": "background-color: rgba(77,171,247,0.08);",
+                    "UNKNOWN": "",
+                }
+
+                def _color_rows(row):
+                    color = verdict_colors.get(row.get("Verdict", ""), "")
+                    return [color] * len(row)
+
+                styled = df_ips.style.apply(_color_rows, axis=1)
+
                 event = st.dataframe(
-                    df_ips,
+                    styled,
                     width="stretch",
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
-                    key=f"osint_ips_{len(ip_rows)}",
+                    key=f"osint_ips_v2_{len(ip_rows)}",
                 )
 
                 current_sel = event.selection.rows
-                # Check for change
                 if current_sel != st.session_state["last_ip_sel"]:
                     st.session_state["last_ip_sel"] = current_sel
-                    # If new selection is present, show dialog
                     if current_sel:
                         idx = current_sel[0]
                         target_ip = df_ips.iloc[idx]["IP"]
                         show_whois_dialog(target_ip)
+
+                # Verdict summary
+                from collections import Counter
+                verdict_counts = Counter(r["Verdict"] for r in ip_rows if "Verdict" in r)
+                # Use the original ip_rows which still has Verdict
+                parts = []
+                for v in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "CLEAN"]:
+                    cnt = verdict_counts.get(v, 0)
+                    if cnt:
+                        parts.append(f"{_verdict_badge(v)} ×{cnt}")
+                if parts:
+                    st.markdown(" ".join(parts), unsafe_allow_html=True)
             else:
                 st.info("No public IP findings.")
 
-        # Domains Tab
+        # ==================== DOMAINS TAB ====================
         with tab_doms:
-            st.caption("Select a row to view WHOIS information.")
+            st.caption("Domain enrichment — select a row for WHOIS lookup.")
             dom_rows = []
             for dom, obj in (osint_data.get("domains") or {}).items():
-                vt_attr = (obj.get("vt") or {}).get("data", {}).get("attributes", {})
-                cats = vt_attr.get("categories", "n/a")
-                dom_rows.append({"Domain": dom, "VT Categories": str(cats)})
+                vt = obj.get("vt") or {}
+                vt_attr = vt.get("data", {}).get("attributes", {})
+                stats = vt_attr.get("last_analysis_stats", {})
+                malicious = stats.get("malicious", 0)
+                total = sum(stats.values()) if stats else 0
+
+                otx = obj.get("otx") or {}
+                pulse_info = otx.get("pulse_info", {})
+                pulse_count = len(pulse_info.get("pulses", [])) if isinstance(pulse_info, dict) else 0
+
+                cats = vt_attr.get("categories", {})
+                cat_str = ", ".join(str(v) for v in cats.values()) if isinstance(cats, dict) and cats else "n/a"
+
+                verdict = _determine_domain_verdict(obj)
+                category = _categorize_domain(dom, vt_attr)
+
+                # WHOIS-like data from VT
+                creation_date = vt_attr.get("creation_date", "")
+                registrar = vt_attr.get("registrar", "")
+
+                # Domain age calculation
+                age_str = "n/a"
+                if creation_date:
+                    try:
+                        import datetime
+                        if isinstance(creation_date, (int, float)):
+                            created = datetime.datetime.fromtimestamp(creation_date, tz=datetime.timezone.utc)
+                        else:
+                            created = datetime.datetime.fromisoformat(str(creation_date))
+                        age_days = (datetime.datetime.now(datetime.timezone.utc) - created).days
+                        if age_days < 30:
+                            age_str = f"⚠️ {age_days}d"
+                        elif age_days < 365:
+                            age_str = f"{age_days // 30}mo"
+                        else:
+                            age_str = f"{age_days // 365}y"
+                    except Exception:
+                        age_str = "n/a"
+
+                dom_rows.append({
+                    "Verdict": verdict.upper(),
+                    "Domain": dom,
+                    "Category": category,
+                    "VT Detections": f"{malicious}/{total}" if total > 0 else "n/a",
+                    "OTX Pulses": pulse_count,
+                    "VT Categories": cat_str,
+                    "Registrar": registrar or "n/a",
+                    "Age": age_str,
+                    "_sort": {"critical": 4, "high": 3, "medium": 2, "low": 1, "clean": 0}.get(verdict, 0),
+                })
 
             if dom_rows:
+                dom_rows.sort(key=lambda r: r["_sort"], reverse=True)
+                for r in dom_rows:
+                    del r["_sort"]
+
                 df_doms = pd.DataFrame(dom_rows)
-                render_export_buttons(df_doms, "osint_domains", key_suffix="doms", is_dataframe=True)
+                render_export_buttons(df_doms, "osint_domains", key_suffix="doms_v2", is_dataframe=True)
+
+                verdict_colors = {
+                    "CRITICAL": "background-color: rgba(255,107,107,0.15);",
+                    "HIGH": "background-color: rgba(255,169,77,0.15);",
+                    "MEDIUM": "background-color: rgba(255,212,59,0.10);",
+                    "LOW": "",
+                    "CLEAN": "background-color: rgba(77,171,247,0.08);",
+                }
+
+                def _color_dom_rows(row):
+                    color = verdict_colors.get(row.get("Verdict", ""), "")
+                    return [color] * len(row)
+
+                styled = df_doms.style.apply(_color_dom_rows, axis=1)
+
                 event = st.dataframe(
-                    df_doms,
+                    styled,
                     width="stretch",
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
-                    key=f"osint_doms_{len(dom_rows)}",
+                    key=f"osint_doms_v2_{len(dom_rows)}",
                 )
 
                 current_sel = event.selection.rows
@@ -433,10 +1219,124 @@ def render_osint(result_col, osint_data):
                         idx = current_sel[0]
                         target_dom = df_doms.iloc[idx]["Domain"]
                         show_whois_dialog(target_dom)
+
+                # Verdict summary
+                from collections import Counter
+                dom_verdict_counts = Counter(r["Verdict"] for r in dom_rows if "Verdict" in r)
+                parts = []
+                for v in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "CLEAN"]:
+                    cnt = dom_verdict_counts.get(v, 0)
+                    if cnt:
+                        parts.append(f"{_verdict_badge(v)} ×{cnt}")
+                if parts:
+                    st.markdown(" ".join(parts), unsafe_allow_html=True)
+
+                # Passive DNS section
+                st.markdown("---")
+                st.markdown("##### Passive DNS History")
+                st.caption("Historical resolution data from VirusTotal / OTX.")
+                pdns_rows = []
+                for dom, obj in (osint_data.get("domains") or {}).items():
+                    # VT passive DNS (resolutions)
+                    vt = obj.get("vt") or {}
+                    vt_attr = vt.get("data", {}).get("attributes", {})
+                    last_dns = vt_attr.get("last_dns_records", [])
+                    if isinstance(last_dns, list):
+                        for rec in last_dns[:5]:
+                            pdns_rows.append({
+                                "Domain": dom,
+                                "Type": rec.get("type", ""),
+                                "Value": rec.get("value", ""),
+                                "TTL": rec.get("ttl", ""),
+                                "Source": "VirusTotal",
+                            })
+
+                    # OTX passive DNS
+                    otx = obj.get("otx") or {}
+                    pdns = otx.get("passive_dns", [])
+                    if isinstance(pdns, list):
+                        for rec in pdns[:5]:
+                            pdns_rows.append({
+                                "Domain": dom,
+                                "Type": "A",
+                                "Value": rec.get("address", rec.get("hostname", "")),
+                                "TTL": "",
+                                "Source": "OTX",
+                            })
+
+                if pdns_rows:
+                    st.dataframe(pd.DataFrame(pdns_rows), width="stretch", hide_index=True)
+                else:
+                    st.caption("No passive DNS records available.")
             else:
                 st.info("No domain findings.")
 
-        # Devices Tab
+        # ==================== DETAIL CARDS TAB ====================
+        with tab_details:
+            st.markdown("#### IP Detail Cards")
+            st.caption("Expand any card for full provider data, vulnerabilities, and context.")
+            ips_data = osint_data.get("ips") or {}
+            if ips_data:
+                # Sort by threat level
+                sorted_ips = []
+                for ip, obj in ips_data.items():
+                    vt = _extract_vt_ip_stats(obj)
+                    abuse = _extract_abuseipdb_stats(obj)
+                    gn = _extract_greynoise_stats(obj)
+                    shodan = _extract_shodan_stats(obj)
+                    verdict = _determine_ip_verdict(vt, abuse, gn, shodan)
+                    sort_val = {"critical": 4, "high": 3, "medium": 2, "low": 1, "clean": 0}.get(verdict, 0)
+                    sorted_ips.append((sort_val, ip, obj, vt, abuse, gn, shodan))
+                sorted_ips.sort(key=lambda x: x[0], reverse=True)
+
+                for _, ip, obj, vt, abuse, gn, shodan in sorted_ips:
+                    _render_ip_detail_card(ip, obj, vt, abuse, gn, shodan)
+            else:
+                st.info("No IP data available for detail view.")
+
+        # ==================== GEO MAP TAB ====================
+        with tab_geo:
+            _render_geo_map(osint_data)
+
+        # ==================== INFRASTRUCTURE TAB ====================
+        with tab_infra:
+            _render_asn_grouping(osint_data)
+            st.markdown("---")
+            _render_related_iocs(osint_data)
+
+            # Threat actor attribution via OTX pulses
+            st.markdown("---")
+            st.markdown("#### Threat Intelligence Attribution")
+            st.caption("Threat actors and campaigns linked to observed IOCs via OTX pulses.")
+
+            pulse_rows = []
+            for dom, obj in (osint_data.get("domains") or {}).items():
+                otx = obj.get("otx") or {}
+                pulse_info = otx.get("pulse_info", {})
+                if isinstance(pulse_info, dict):
+                    for pulse in pulse_info.get("pulses", [])[:10]:
+                        tags = pulse.get("tags", [])
+                        pulse_rows.append({
+                            "IOC": dom,
+                            "Pulse": pulse.get("name", ""),
+                            "Author": pulse.get("author_name", ""),
+                            "Created": str(pulse.get("created", ""))[:10],
+                            "Tags": ", ".join(tags[:5]) if isinstance(tags, list) else "",
+                            "TLP": pulse.get("TLP", ""),
+                        })
+
+            if pulse_rows:
+                df_pulses = pd.DataFrame(pulse_rows)
+                render_export_buttons(df_pulses, "otx_pulses", key_suffix="pulses", is_dataframe=True)
+                st.dataframe(df_pulses, width="stretch", hide_index=True)
+            else:
+                st.caption("No threat intelligence attribution data available.")
+
+        # ==================== EXPORT TAB ====================
+        with tab_export:
+            _render_ioc_export_panel(osint_data)
+
+        # ==================== DEVICES TAB ====================
         with tab_devices:
             st.markdown("#### Device & MAC Identification")
             mac_data = osint_data.get("macs") or {}
@@ -447,6 +1347,10 @@ def render_osint(result_col, osint_data):
                 st.dataframe(pd.DataFrame(mac_rows), width="stretch", hide_index=True)
             else:
                 st.info("No MAC address information available.")
+
+        # ==================== NOTES TAB ====================
+        with tab_notes:
+            _render_analyst_notes(osint_data)
 
 
 def render_flows(result_col, flows: list[dict] | None):
